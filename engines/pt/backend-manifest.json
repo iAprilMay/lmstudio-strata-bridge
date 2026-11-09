@@ -1,0 +1,21 @@
+{
+  "name": "strata-linux-x86_64-avx2",
+  "domains": ["llm"],
+  "version": "2.72.0",
+  "engine": "vllm",
+  "target_libraries": [
+    { "name": "llm_engine.node", "type": "llm_engine", "version": "0.1.2" },
+    { "name": "liblmstudio_bindings.node", "type": "liblmstudio", "version": "0.2.26" }
+  ],
+  "platform": "linux",
+  "cpu": { "architecture": "x86_64", "instruction_set_extensions": ["AVX2"] },
+  "supported_model_formats": ["torchSafetensors"],
+  "manifest_version": "4",
+  "extension_type": "engine",
+  "minimum_lmstudio_version": "0.4.0+15",
+  "minimum_llmster_version": "0.0.1+9",
+  "engine_protocol_server": {
+    "runtime_kind": "vllm",
+    "executable_relative_path": "strata-launch"
+  }
+}

@@ -1,0 +1,29 @@
+# Repo-wide hygiene for this bridge — a publishable tree. Each sub-project covers
+# its own outputs; this catches strays and anything secret-shaped anywhere below.
+
+# Node deps + build caches (plugin + rag build outputs)
+node_modules/
+.turbo/
+dist/
+build/
+
+# Python / shell strays
+__pycache__/
+*.pyc
+
+# Local env / secrets — never publish
+.env
+.env.*
+!.env.example
+
+# Generated stub model dirs (written by scripts/make-stub-*.sh on a bare run)
+.generated/
+
+# Logs and captures (shim logs, server logs, probes)
+*.log
+logs/
+
+# Editor / OS strays
+.DS_Store
+*.swp
+*.orig

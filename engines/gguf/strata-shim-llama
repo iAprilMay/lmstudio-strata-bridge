@@ -1,0 +1,593 @@
+#!/usr/bin/env node
+/*
+ * strata-shim-llama — engine-protocol server for the `llama-server`
+ * runtime kind (the GGUF route).
+ *
+ * LM Studio spawns this process (via the llama-server-kind backend manifest's
+ * `engine_protocol_server.executable_relative_path`) and then dials it as if it
+ * were a llama.cpp `llama-server`. This is not llama.cpp: it mirrors the Strata
+ * instance that is ALREADY running, proxying the generation endpoints to Strata's
+ * gateway. No weights are ever loaded here (decision: never create a second model
+ * instance).
+ *
+ * WHY A SEPARATE SHIM FROM strata-shim (the vllm route):
+ *   The vllm driver's applyPromptTemplate is an UNCONDITIONAL client-side throw
+ *   (a promptTemplating capability gap) — it never reaches the shim, so LM Studio's
+ *   BUILT-IN lmstudio/rag-v1 preprocessor is a
+ *   dead end on the vllm runtime kind. The llama-server driver has NO such
+ *   override: it inherits the generic engine-protocol client, so applyPromptTemplate
+ *   dispatches as an RPC to the engine -> POST /apply-template reaches THIS shim,
+ *   which renders the chat template and returns {prompt}. That is the whole point
+ *   of the GGUF route: make the built-in rag-v1 work WITHOUT patching any app code, by
+ *   moving the fake model to a llama-server-kind (GGUF) engine.
+ *
+ * HTTP server implementing the engine-protocol contract; no proprietary
+ * code shared. No LM Studio source or binary is copied. The app's own .node
+ * libraries are referenced in place by symlink/copy in the extension dir, never
+ * vendored here.
+ *
+ * Contract (llama-server kind). ALL endpoints are PLAIN HTTP
+ * JSON via the engine-protocol client (NOT WS RPC — the WS RPC in the bundle is the
+ * LOCAL-INVOKER handoff, not the engine protocol):
+ *   GET  /health                 -> 2xx (JSON body, parsed)
+ *   GET  /v1/models              -> data[].id === instanceReference + max_model_len > 0
+ *   GET  /props                  -> MUST include default_generation_settings.n_ctx (number > 0)
+ *   POST /apply-template         -> body {messages:[...], (addGenerationPrompt?), (enableThinking?)}
+ *                                   -> response reads a 'prompt' string (REQUIRED)
+ *   POST /tokenize               -> {tokens, count} s a 'prompt' string
+ *   POST /detokenize             -> {model, tokens} -> {prompt}
+ *   POST /v1/chat/completions    -> streaming SSE (predict path)
+ *   POST /v1/completions         -> streaming SSE (completeRawText path)
+ *   GET  /v1/systemone           -> systemOne (optional; 200 ok)
+ *   GET  /status                 -> status (optional)
+ *
+ * Spawn shape LM Studio hands us (llama-server, NO --served-model-name unlike vllm):
+ *   <path> --model <ggufPath> --host 127.0.0.1 --port <random> --api-key <key>
+ *   (the llama-server launch parses the GGUF for launch args,
+ *    then appends --host/--port/--api-key.)
+ *
+ * The served id is derived from --model (the GGUF path) -- see SERVED_ID below. The
+ * id-match in the load-info read is `data.find(x => x.id === instanceReference)`. For
+ * a local GGUF load the served id is the model path; BOTH the raw --model value AND
+ * its basename are echoed so whichever LM Studio uses matches (empirical -- the load
+ * test is the decider, same discipline as the vLLM route).
+ *
+ * Unlike the vllm route, llama-server's endpoint resolver honours the --port LM Studio
+ * passes (there is NO static :8000 resolver), so ONLY the passed --port is bound.
+ */
+
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+
+// Reuse the proven Strata-proxy plumbing from the vllm shim (gateway discovery, key
+// reading, tokenizer, SSE reshaping, metrics). Importing strata-shim does NOT start a
+// server (it only starts under import.meta.main). The file is literally named `strata-shim`
+// (no extension), so import it by an absolute file:// URL. Derive the directory from THIS
+// module's own URL (import.meta.url) so it resolves correctly whether spawned by LM Studio
+// (process.argv[1] set) or imported by a test (argv[1] unset).
+const shimSelfUrl = import.meta.url; // file://<dir>/strata-shim-llama
+const shimDir = shimSelfUrl.replace(/\/[^/]*$/, ""); // strip the filename -> file://<dir>
+// In the DEPLOYED ext dir both shims sit side-by-side, so `${shimDir}/strata-shim`
+// resolves. In the SPLIT source layout (engines/gguf/ vs engines/pt/) the shared
+// shim lives one level up in engines/pt/, so fall back to that relative path.
+let shimMod;
+try {
+  shimMod = await import(`${shimDir}/strata-shim`);
+} catch {
+  shimMod = await import(`${shimDir}/../pt/strata-shim`);
+}
+// The module exports named bindings (no default), so alias the module object itself;
+// S.shimLog / S.tokenize / etc. read the live exported bindings.
+const S = shimMod;
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+// ---- parse the flags LM Studio passes (llama-server dialect) --------------
+function parseArgs(argv) {
+  let model = null;
+  let host = null;
+  let passedPort = null;
+  let apiKey = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--model") model = argv[++i];
+    else if (a === "-m") model = argv[++i];
+    else if (a === "--host") host = argv[++i];
+    else if (a === "--port") passedPort = argv[++i];
+    else if (a === "--api-key") apiKey = argv[++i];
+  }
+  return { model, host, passedPort, apiKey };
+}
+
+const args = parseArgs(process.argv.slice(2));
+
+// ---- reported model name (activity feed) ----------------------------------
+// Same wrapper trick as the vllm route: the launcher (strata-launch-llama) exec -a's
+// the bridge name so argv[0] is correct at spawn. The bridge name is also set via
+// process.title here so tools reading the live cmdline see the bridge. Version read
+// from the sibling backend-manifest.json.
+function bridgeVersion() {
+  try {
+    const dir = shimSelfUrl.replace(/^file:\/\//, "").replace(/\/[^/]*$/, ""); // plain dir
+    const mf = JSON.parse(fs.readFileSync(`${dir}/backend-manifest.json`, "utf8"));
+    if (mf.version) return String(mf.version);
+  } catch {}
+  return process.env.BRIDGE_VERSION || "9.9.9";
+}
+const REPORTED_MODEL_NAME = `lm-studio-bridge-v${bridgeVersion()}`;
+process.title = REPORTED_MODEL_NAME;
+
+// Refuse a non-loopback host: this shim is loopback-only, never a remote mode.
+if (args.host !== null && !LOOPBACK_HOSTS.has(String(args.host).toLowerCase())) {
+  process.stderr.write(`strata-shim-llama refuses non-loopback host: ${args.host}\n`);
+  process.exit(1);
+}
+
+// ---- served id (what /v1/models must echo to satisfy the id-match) --------
+// llama-server has no --served-model-name. The id-match is data.find(x => x.id ===
+// instanceReference). For a local GGUF load the served id is the model path. BOTH the
+// raw --model value AND its basename (and the GGUF's <basename minus .gguf>) are echoed
+// so whichever LM Studio uses matches. Empirical: the load test is the decider.
+const MODEL_BASENAME = args.model ? args.model.replace(/\/+$/, "").split("/").pop() : null;
+const MODEL_BASENAME_NOEXT = MODEL_BASENAME ? MODEL_BASENAME.replace(/\.gguf$/i, "") : null;
+// Candidate ids, in priority order. /v1/models returns the first; /props + others echo it.
+const SERVED_ID_CANDIDATES = [...new Set([args.model, MODEL_BASENAME, MODEL_BASENAME_NOEXT].filter(Boolean))];
+const SERVED_ID = SERVED_ID_CANDIDATES[0] || "strata-llama";
+
+// ---- bind ONLY the passed --port (llama-server honours it; no :8000 resolver) --
+const BIND_HOST = "127.0.0.1";
+const passedPortNum = (() => {
+  const n = Number(args.passedPort);
+  return Number.isInteger(n) && n >= 1 && n <= 0xffff ? n : null;
+})();
+const BIND_PORTS = [...new Set([passedPortNum].filter((p) => p !== null))];
+
+// ---- chat-template renderer (applyPromptTemplate) -------------------------
+// The llama-server driver inherits the generic client, so rag-v1's applyPromptTemplate
+// reaches this shim as POST /apply-template with body {messages:[...], (addGenerationPrompt?),
+// (enableThinking?)}. It must return {prompt} = the rendered ChatML string. A qwen3 ChatML
+// template is rendered (matches the GGUF's tokenizer.chat_template arch). This is the
+// bridge's renderer -- it does not call the gateway, it just serialises the messages the
+// way a qwen3 ChatML model expects, so rag-v1's measureContextWindow (applyPromptTemplate
+// -> countTokens -> getContextLength) sees a realistic rendered prompt.
+function renderChatTemplate(messages, addGenerationPrompt, enableThinking) {
+  const parts = [];
+  for (const m of messages) {
+    const role = typeof m?.role === "string" ? m.role : "user";
+    let content = "";
+    const c = m?.content;
+    if (typeof c === "string") content = c;
+    else if (Array.isArray(c)) {
+      // content parts (text + image placeholders) -> concatenate text, mark images
+      content = c.map((p) => (p?.type === "text" ? String(p?.text ?? "") : "<|image|>")).join("");
+    } else if (c != null) content = String(c);
+    let line = `<|im_start|>${role}\n${content}<|im_end|>\n`;
+    parts.push(line);
+  }
+  // enable_thinking: qwen3 emits an open <|im_start|> block for the assistant turn when on.
+  let assistantOpen = "<|im_start|>assistant\n";
+  if (enableThinking) assistantOpen = "<|im_start|>assistant\n<|im_start|>\n";
+  if (addGenerationPrompt !== false) parts.push(assistantOpen);
+  return parts.join("");
+}
+
+// ---- start (only when run as the main program, not when imported) --------
+if (import.meta.main) {
+  // One-time startup diagnostic (shared with the vllm route): log what LM Studio
+  // passed on the spawn line, to see empirically whether runtime knobs such as
+  // "Max Concurrent Predictions" reach an engine-protocol backend. The --api-key
+  // VALUE is masked by the redactor.
+  S.logSpawnArgs();
+
+  async function handle(req, res) {
+    const url = req.url || "/";
+    const path = url.split("?")[0];
+    const method = req.method;
+
+    // /health — readiness parses the body as JSON, so return a valid object.
+    if (path === "/health" && (method === "GET" || method === "HEAD")) {
+      res.statusCode = 200;
+      res.end("{}");
+      return;
+    }
+
+    // /v1/models — echo the served id so the driver's id match succeeds. Report the REAL
+    // Strata context (discovered from native-tune) so the loaded instance + picker show
+    // the true context.
+    if (path === "/v1/models" && method === "GET") {
+      const strataCtx = await S.resolveStrataMaxContext();
+      const advertised = S.advertiseMaxModelLen(strataCtx);
+      const data = SERVED_ID_CANDIDATES.map((id) => ({
+        id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "strata",
+        max_model_len: advertised,
+      }));
+      res.statusCode = 200;
+      res.end(JSON.stringify({ object: "list", data }));
+      return;
+    }
+
+    // /props — the load-info read ALSO dials GET /props and REQUIRES
+    // default_generation_settings.n_ctx (number > 0), else it warns
+    // "llama-server /props did not include default_generation_settings".
+    if (path === "/props" && (method === "GET" || method === "HEAD")) {
+      const strataCtx = await S.resolveStrataMaxContext();
+      res.statusCode = 200;
+      res.end(JSON.stringify({
+        n_ctx: S.advertiseMaxModelLen(strataCtx),
+        n_predict: -1,
+        n_ctx_train: S.advertiseMaxModelLen(strataCtx),
+        model: SERVED_ID,
+        chat_template: "chatml",
+        special: ["<|im_start|>", "<|im_end|>"],
+        // Cosmetic: mirror a native llama.cpp /props profile (4 slots, flash-attn
+        // on). LM Studio drives these from its OWN config and never reads them back
+        // from an engine-protocol backend, so this is shape-consistency only -- no
+        // VRAM is reserved (no native weight load happens here).
+        n_parallel: S.ADVERTISED_CONCURRENT_PREDICTIONS,
+        flash_attn: S.ADVERTISED_FLASH_ATTENTION,
+        default_generation_settings: {
+          n_ctx: S.advertiseMaxModelLen(strataCtx),
+          temp: 0.7,
+          n_predict: -1,
+        },
+      }));
+      return;
+    }
+
+    // /apply-template — the rag-v1 seam. Render the chat template, return {prompt}.
+    if (path === "/apply-template" && method === "POST") {
+      const body = await S.readJson(req);
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const prompt = renderChatTemplate(messages, body.addGenerationPrompt, body.enableThinking);
+      S.shimLog("DEBUG", `apply-template: ${messages.length} messages -> prompt ${prompt.length} chars`);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ prompt }));
+      return;
+    }
+
+    // /tokenize — accept the input under ANY of the dialect's key names. The llama-server
+    // driver's tokenize method POSTs body {content: inputString} --
+    // key "content", NOT "prompt". countTokens = tokenize(...).length, so a missing "content"
+    // read made the conversation-summary tokenCount report 0 (the bug). Also keep "prompt"
+    // (string OR list, rag-v1 sends a list of chunks) and "messages" for other callers.
+    if (path === "/tokenize" && method === "POST") {
+      const body = await S.readJson(req);
+      let text = "";
+      if (typeof body.content === "string") text = body.content;
+      else if (typeof body.prompt === "string") text = body.prompt;
+      else if (Array.isArray(body.prompt)) text = body.prompt.map((p) => (typeof p === "string" ? p : "")).join("");
+      else if (Array.isArray(body.messages)) text = body.messages.map((m) => String(m?.content ?? "")).join("");
+      // #7d state: return the local integer-ID tokenize() count. The llama-server dialect validates
+      // every token is a nonnegative integer, so tokenize() returns integer IDs whose length is the
+      // count. (The gateway-count experiment #7e was reverted -- it caused a regression.)
+      const tokens = S.tokenize(text);
+      const count = tokens.length;
+      const strataCtx = await S.resolveStrataMaxContext();
+      // DIAGNOSTIC: surface the inbound tokenize body shape + which count source was used.
+      const keys = Object.keys(body).join(",");
+      const cType = typeof body.content === "string" ? `str(${body.content.length})` : (body.content === undefined ? "absent" : (Array.isArray(body.content) ? `list(${body.content.length})` : typeof body.content));
+      const pType = typeof body.prompt === "string" ? `str(${body.prompt.length})` : (Array.isArray(body.prompt) ? `list(${body.prompt.length})` : (body.prompt === undefined ? "absent" : typeof body.prompt));
+      const mLen = Array.isArray(body.messages) ? `msgs(${body.messages.length})` : "none";
+      S.shimLog("DEBUG", `tokenize: ${count} tokens (local=${tokens.length}) | text=${text.length} chars | body keys=${keys} content=${cType} prompt=${pType} messages=${mLen}`);
+      res.statusCode = 200;
+      res.end(JSON.stringify({
+        tokens,
+        count,
+        tokens_max_model_len: S.advertiseMaxModelLen(strataCtx),
+      }));
+      return;
+    }
+
+    // /detokenize
+    if (path === "/detokenize" && method === "POST") {
+      const body = await S.readJson(req);
+      const tokens = Array.isArray(body.tokens) ? body.tokens : [];
+      res.statusCode = 200;
+      res.end(JSON.stringify({ prompt: S.detokenize(tokens) }));
+      return;
+    }
+
+    // /v1/systemone — optional; answer 200 so the driver does not error.
+    if (path === "/v1/systemone" && (method === "GET" || method === "POST")) {
+      res.statusCode = 200;
+      res.end("{}");
+      return;
+    }
+
+    // /status — optional.
+    if (path === "/status" && (method === "GET" || method === "HEAD")) {
+      res.statusCode = 200;
+      res.end(JSON.stringify({ status: "OK", id: SERVED_ID }));
+      return;
+    }
+
+    // /v1/chat/completions and /v1/completions — proxy to the gateway, stream SSE.
+    if ((path === "/v1/chat/completions" || path === "/v1/completions") && method === "POST") {
+      await proxyCompletion(req, res, path);
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: { message: `strata-shim-llama: no route for ${method} ${path}` } }));
+  }
+
+  // ---- completion proxy (reuses the vllm shim's gateway + SSE helpers) ----
+  async function proxyCompletion(req, res, path) {
+    const t0 = Date.now();
+    const body = await S.readJson(req);
+    const wantStream = body.stream === true;
+
+    const promptLen = typeof body.prompt === "string"
+      ? body.prompt.length
+      : (Array.isArray(body.messages) ? body.messages.reduce((n, m) => n + String(m?.content ?? "").length, 0) : 0);
+    const outBudget = body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens ?? null;
+    const hasResponseFormat = body.response_format !== undefined && body.response_format !== null;
+    const rfType = hasResponseFormat ? (body.response_format?.type ?? "?") : null;
+    const reasoningEffortIn = body.reasoning_effort ?? body.reasoningEffort ?? null;
+    const toolsIn = Array.isArray(body.tools) ? body.tools.length : (body.tools ? "set" : "none");
+    S.shimLog("DEBUG", `Received request: ${req.method} to ${path} body=${S.logBody(body)} (prompt_len=${promptLen}, stream=${wantStream}, max_tokens=${outBudget}, response_format=${hasResponseFormat ? rfType : "none"}, reasoning_effort=${reasoningEffortIn}, tools=${toolsIn})`);
+
+    let gatewayModel;
+    try {
+      gatewayModel = await S.discoverGatewayModel();
+    } catch (err) {
+      res.statusCode = 502;
+      res.end(JSON.stringify({ error: { message: `gateway model discovery failed: ${err}` } }));
+      return;
+    }
+    body.model = gatewayModel;
+    const servedName = SERVED_ID;
+
+    const isCompletions = path === "/v1/completions";
+    let gatewayBody;
+    if (isCompletions) {
+      const prompt = typeof body.prompt === "string" ? body.prompt : "";
+      gatewayBody = { model: gatewayModel, messages: [{ role: "user", content: prompt }], stream: true };
+      if (body.max_tokens !== undefined) gatewayBody.max_tokens = body.max_tokens;
+      if (body.temperature !== undefined) gatewayBody.temperature = body.temperature;
+      if (body.stop !== undefined) gatewayBody.stop = body.stop;
+    } else {
+      body.stream = true;
+      gatewayBody = body;
+    }
+
+    // Structured-output budget floor (same as vllm route): the gateway free-runs and
+    // spends ~100-130 reasoning tokens before JSON, so a small max_tokens truncates
+    // mid-reasoning -> finish_reason=length -> LM Studio rejects the structured output.
+    if (hasResponseFormat) {
+      const strataCtx = await S.resolveStrataMaxContext();
+      const floor = Math.min(S.STRUCTURED_OUTPUT_MIN_TOKENS, strataCtx);
+      const cur = gatewayBody.max_tokens;
+      if (typeof cur === "number" && cur < floor) {
+        gatewayBody.max_tokens = floor;
+        S.shimLog("DEBUG", `structured output: raised max_tokens ${cur} -> ${floor} (response_format=${rfType})`);
+      }
+    }
+
+    // Reasoning-effort translation (gateway honours OpenAI reasoning_effort).
+    const effortFromRequest = reasoningEffortIn !== null && reasoningEffortIn !== undefined
+      ? String(reasoningEffortIn).toLowerCase()
+      : null;
+    const effectiveEffort = effortFromRequest ?? S.manualReasoningEffort();
+    if (effectiveEffort !== null && effectiveEffort !== "off" && effectiveEffort !== "none" && effectiveEffort !== "") {
+      gatewayBody.reasoning_effort = effectiveEffort;
+      S.shimLog("DEBUG", `reasoning_effort -> gateway: ${effectiveEffort}${effortFromRequest === null ? " (manual default)" : ""}`);
+    }
+
+    const key = S.readStrataKey();
+    const upstream = await fetch(`${await S.resolveGatewayBase()}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        "user-agent": S.GATEWAY_USER_AGENT,
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify(gatewayBody),
+    });
+
+    if (!upstream.ok) {
+      res.statusCode = upstream.status;
+      res.end(JSON.stringify({ error: { message: `gateway HTTP ${upstream.status}` } }));
+      return;
+    }
+
+    if (wantStream) {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/event-stream");
+      try { res.flushHeaders(); } catch {}
+    }
+
+    const streamStartAt = Date.now();
+    let firstTokenAt = null;
+    let lastTokenAt = null;
+    let tokenCount = 0;
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const events = [];
+    let doneSeen = false;
+
+    const collectEvent = (ev) => {
+      if (ev.includes("[DONE]")) { doneSeen = true; return; }
+      events.push(ev);
+      const now = Date.now();
+      if (S.eventHasDelta(ev)) {
+        if (firstTokenAt === null) firstTokenAt = now;
+        lastTokenAt = now;
+        tokenCount++;
+      }
+      if (wantStream) {
+        let out = S.reshapeEvent(ev, servedName, isCompletions);
+        if (S.eventFinishReason(ev) || S.eventHasUsage(ev)) {
+          out = S.injectMetrics(out, S.buildMetrics(streamStartAt, firstTokenAt, lastTokenAt, tokenCount, S.eventTimings(ev)));
+        }
+        res.write(S.stripSseComments(out) + "\n\n");
+      }
+    };
+
+    const drain = () => {
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const ev = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        collectEvent(ev);
+      }
+    };
+
+    try {
+      const reader = upstream.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        drain();
+      }
+      buffer += decoder.decode(new Uint8Array(), { stream: false });
+      drain();
+      if (buffer.trim().length > 0) collectEvent(buffer);
+    } catch (err) {
+      if (!wantStream || !res.headersSent) {
+        res.statusCode = 502;
+        res.end(JSON.stringify({ error: { message: `gateway stream failed: ${err}` } }));
+      }
+      return;
+    }
+
+    if (wantStream) {
+      if (!doneSeen) res.write("data: [DONE]\n\n");
+      res.end();
+      let streamFinish = null;
+      let streamToolCallDeltas = 0;
+      for (const ev of events) {
+        for (const line of ev.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice("data:".length).replace(/^ /, "");
+          if (payload === "[DONE]" || payload.length === 0) continue;
+          let obj; try { obj = JSON.parse(payload); } catch { continue; }
+          for (const c of (Array.isArray(obj?.choices) ? obj.choices : [])) {
+            if (c?.finish_reason) streamFinish = c.finish_reason;
+            const d = c?.delta;
+            if (d && Array.isArray(d.tool_calls)) streamToolCallDeltas += d.tool_calls.length;
+          }
+        }
+      }
+      S.shimLog("INFO", `streamed completion done in ${Date.now() - t0}ms (${events.length} events, finish_reason=${streamFinish}, tool_call_deltas=${streamToolCallDeltas})`);
+      let sTimings = null;
+      for (const ev of events) { const t = S.eventTimings(ev); if (t) sTimings = t; }
+      let sUsage = null;
+      for (const ev of events) { const u = S.eventUsage(ev); if (u) sUsage = u; }
+      for (const line of S.printTimingLines(sTimings, sUsage)) S.shimLog("INFO", line);
+      return;
+    }
+
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json");
+    const aggregated = S.aggregateEvents(events, servedName, isCompletions);
+    let gatewayTimings = null;
+    for (const ev of events) { const t = S.eventTimings(ev); if (t) gatewayTimings = t; }
+    let nonStreamTokens = 0;
+    for (const ev of events) if (S.eventHasDelta(ev)) nonStreamTokens++;
+    const genMs = Math.max(0, Date.now() - t0);
+    const gaps = nonStreamTokens - 1;
+    const nsMetrics = S.buildMetrics(t0, t0, Date.now(), nonStreamTokens, gatewayTimings) ?? {
+      time_to_first_token_ms: 0,
+      generation_time_ms: genMs,
+      mean_itl_ms: gaps > 0 ? genMs / gaps : 0,
+    };
+    aggregated.metrics = nsMetrics;
+    res.end(JSON.stringify(aggregated));
+    S.shimLog("INFO", `non-streaming completion done in ${Date.now() - t0}ms (response=${S.logBody(aggregated)})`);
+    let nsUsage = null;
+    for (const ev of events) { const u = S.eventUsage(ev); if (u) nsUsage = u; }
+    for (const line of S.printTimingLines(gatewayTimings, nsUsage)) S.shimLog("INFO", line);
+  }
+
+  // ---- server + bind (only the passed --port; llama honours it) -----------
+  function makeServer() {
+    return http.createServer((req, res) => {
+      const t0 = Date.now();
+      const p = (req.url || "/").split("?")[0];
+      handle(req, res).catch((err) => {
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: { message: String(err) } }));
+        }
+        S.shimLog("ERROR", `request ${req.method} ${p} failed: ${String(err)}`);
+      });
+      res.on("finish", () => {
+        if (p !== "/v1/chat/completions" && p !== "/v1/completions") {
+          S.shimLog("DEBUG", `request ${req.method} ${p} -> ${res.statusCode} ${Date.now() - t0}ms`);
+        }
+      });
+    });
+  }
+
+  // Free other llama shims' ports on a reload race (bridge processes only).
+  function killOtherShims() {
+    const self = process.pid;
+    let killed = 0;
+    try {
+      const proc = fs.readdirSync("/proc");
+      for (const d of proc) {
+        if (!/^\d+$/.test(d)) continue;
+        const pid = Number(d);
+        if (pid === self) continue;
+        try {
+          const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "binary");
+          if (cmd.includes("strata-shim") || cmd.includes("lm-studio-bridge")) {
+            process.kill(pid, "SIGTERM");
+            S.shimLog("DEBUG", `freed ports: SIGTERM to other strata-shim pid=${pid}`);
+            killed++;
+          }
+        } catch {}
+      }
+    } catch {}
+    return killed;
+  }
+
+  const LISTEN_RETRIES = 20;
+  const LISTEN_RETRY_MS = 500;
+  let listenAttempt = 0;
+
+  function tryListen() {
+    listenAttempt++;
+    const servers = [];
+    let bound = 0;
+    let failed = false;
+    for (const port of BIND_PORTS) {
+      const srv = makeServer();
+      servers.push(srv);
+      srv.once("error", (err) => { failed = true; });
+      srv.listen(port, BIND_HOST, () => {
+        bound++;
+        S.shimLog("DEBUG", `listening on http://${BIND_HOST}:${port}`);
+      });
+    }
+    setTimeout(() => {
+      if (!failed && bound === BIND_PORTS.length) return;
+      if (failed && listenAttempt < LISTEN_RETRIES) {
+        const freed = killOtherShims();
+        S.shimLog("DEBUG", `port busy (teardown race), retrying ${listenAttempt}/${LISTEN_RETRIES} (freed ${freed} other shim(s))`);
+        for (const s of servers) { try { s.close(); } catch {} }
+        setTimeout(tryListen, LISTEN_RETRY_MS);
+      } else if (failed) {
+        S.shimLog("ERROR", "port still in use after retries, giving up");
+        process.exit(1);
+      }
+    }, 100);
+  }
+
+  if (BIND_PORTS.length === 0) {
+    S.shimLog("ERROR", "no valid --port passed; llama-server honours only the passed port");
+    process.exit(1);
+  }
+  tryListen();
+}
+
+// ---- exports (pure functions, importable by tests without starting a server)
+export { renderChatTemplate, parseArgs, SERVED_ID, SERVED_ID_CANDIDATES };

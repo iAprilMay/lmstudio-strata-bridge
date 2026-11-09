@@ -1,0 +1,1519 @@
+#!/usr/bin/env node
+/*
+ * strata-shim — engine-protocol server for the `vllm` runtime kind.
+ *
+ * LM Studio spawns this process (via the backend manifest's
+ * `engine_protocol_server.executable_relative_path`) and then dials it as if it
+ * were a vLLM server. This is not vLLM: it mirrors the Strata instance that is
+ * ALREADY running, proxying the six OpenAI-compatible endpoints to Strata's
+ * gateway. No weights are ever loaded here (decision: never create a second
+ * model instance).
+ *
+ * HTTP server implementing the engine-protocol contract; no proprietary
+ * code shared. No LM Studio source or binary is copied. The app's own .node
+ * libraries are referenced in place by symlink in the extension dir, never
+ * vendored here.
+ *
+ * Contract (vllm kind):
+ *   GET  /health                 -> 2xx
+ *   GET  /v1/models              -> data[].id === served-model-name, max_model_len > 0
+ *   POST /v1/chat/completions    -> streaming SSE (proxy to gateway)
+ *   POST /v1/completions         -> streaming SSE (proxy to gateway)
+ *   POST /tokenize               -> {tokens, count} + tokens_max_model_len
+ *   POST /detokenize             -> {model, tokens} -> {prompt}
+ *
+ * Spawn shape LM Studio hands us:
+ *   <path> -I -m vllm_engine serve <modelDir> --host 127.0.0.1 --port <random>
+ *          --served-model-name <instanceReference> --enable-per-request-metrics
+ *          --enable-prompt-tokens-details --disable-fastapi-docs
+ *   env: LMS_VLLM_API_KEY=<key>, VLLM_API_KEY unset
+ *
+ * The `-I -m vllm_engine serve` prefix is ignored (it assumes a Python
+ * interpreter); --served-model-name is read for the id to echo, and BOTH the
+ * --port LM Studio passed (readiness dials baseUrl = "http://host:<--port>") AND
+ * the static :8000 (used by the load-info / loaded-model reads) are bound. Serving
+ * only 8000 left the readiness dial on the random --port failing.
+ */
+
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+// ---- parse the flags LM Studio passes -------------------------------------
+function parseArgs(argv) {
+  let servedModelName = null;
+  let host = null;
+  let passedPort = null;
+  let maxModelLen = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--served-model-name") servedModelName = argv[++i];
+    else if (a === "--host") host = argv[++i];
+    else if (a === "--port") passedPort = argv[++i];
+    else if (a === "--max-model-len") maxModelLen = argv[++i];
+  }
+  return { servedModelName, host, passedPort, maxModelLen };
+}
+
+const args = parseArgs(process.argv.slice(2));
+
+// ---- spawn-args diagnostic -----------------------------------------------------
+// LM Studio's "Max Concurrent Predictions" (and other runtime knobs) may be passed
+// to an engine-protocol backend on the SPAWN line. Unknown args are ignored (parseArgs
+// reads only the four used), but logging the full argv once at startup reveals
+// EMPIRICALLY what LM Studio actually passes -- e.g. whether a --parallel/-np style
+// concurrency hint reaches us. Secret-safe: any value after a key/token/secret/api/
+// auth flag is masked (the llama-server dialect passes --api-key).
+function redactedArgv(argv) {
+  const secretFlag = /key|token|secret|api|auth|password/i;
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    out.push(a);
+    // If this arg is a secret-bearing flag, mask the NEXT arg (its value).
+    if (secretFlag.test(a) && i + 1 < argv.length && !String(argv[i + 1]).startsWith("--")) {
+      out.push("[redacted]");
+      i++;
+    }
+  }
+  return out;
+}
+function logSpawnArgs() {
+  shimLog("DEBUG", `spawn argv: ${JSON.stringify(redactedArgv(process.argv))}`);
+}
+
+// ---- reported model name (what LM Studio's activity feed shows) ----------------
+// LM Studio's activity feed labels each request with the engine process's command
+// line (argv[0]). Because this is a `#!/usr/bin/env node` script, the kernel rewrites
+// the argv[0] to the interpreter -- `node` -- so the feed shows "node". process.title
+// is overwritten so the feed shows the bridge's own name instead:
+//   lm-studio-bridge-v<version>
+// where <version> is the backend-manifest.json version of this engine extension
+// (read from the sibling manifest at runtime; falls back to 1.0.0). This is purely
+// cosmetic to the feed -- it does NOT touch the gateway request (body.model stays the
+// real loaded Strata id) nor the SSE `model` field (servedName).
+function bridgeVersion() {
+  try {
+    const self = process.argv[1] || "";
+    const dir = self.replace(/\/[^/]*$/, ""); // strip the script filename
+    const mf = JSON.parse(fs.readFileSync(`${dir}/backend-manifest.json`, "utf8"));
+    if (mf.version) return String(mf.version);
+  } catch {}
+  return process.env.BRIDGE_VERSION || "1.0.0";
+}
+const REPORTED_MODEL_NAME = `lm-studio-bridge-v${bridgeVersion()}`;
+process.title = REPORTED_MODEL_NAME;
+
+// ---- reported client identity (what the STRATA GUI shows) ----------------------
+// Strata's GUI labels the endpoint that dialed the gateway with the request's
+// User-Agent header. Node's global fetch sends `user-agent: node` by default, so
+// Strata showed "node" as the reported client. The bridge name overrides it
+// on every gateway request so Strata reports the bridge instead. (This is
+// the gateway-side identity; the LM Studio activity feed uses process.title above.)
+const GATEWAY_USER_AGENT = REPORTED_MODEL_NAME;
+
+// Refuse a non-loopback host: this shim is loopback-only, never a remote mode.
+if (args.host !== null && !LOOPBACK_HOSTS.has(String(args.host).toLowerCase())) {
+  process.stderr.write(`strata-shim refuses non-loopback host: ${args.host}\n`);
+  process.exit(1);
+}
+
+// LM Studio dials TWO ports for the vllm kind:
+//   - readiness uses the runtime handle's baseUrl = "http://host:<--port>"
+//     (the RANDOM --port LM Studio passed on the spawn line), and
+//   - the load-info / loaded-model reads use a static re (not a port
+// invented here); 8000 is the static resolver's choice. Bind whichever are valid.
+const BIND_HOST = "127.0.0.1";
+const STATIC_PORT = 8000;
+const passedPortNum = (() => {
+  const n = Number(args.passedPort);
+  return Number.isInteger(n) && n >= 1 && n <= 0xffff ? n : null;
+})();
+const BIND_PORTS = [...new Set([passedPortNum, STATIC_PORT].filter((p) => p !== null))];
+
+// ---- Strata gateway + key (read at runtime, never logged) -----------------
+// The gateway port is per-boot and NOT recorded in state.json (only the apiKey is
+// there), and it is not in the gateway process cmdline either (the port is chosen
+// at runtime). Strata's GUI does not let the user change it, so the default below
+// is correct for THIS box. But to be robust across boots/boxes, it is AUTO-DISCOVERED
+// per launch: scan /proc for loopback LISTEN sockets owned by a Strata process, then
+// PROBE each candidate by fetching /models with the key and checking it returns a
+// non-empty model list (self-validating). Explicit STRATA_GATEWAY_BASE env wins; if
+// discovery finds nothing, fall back to the default port.
+const DEFAULT_GATEWAY_PORT = 47831;
+const GATEWAY_BASE_ENV = process.env.STRATA_GATEWAY_BASE;
+
+// List loopback LISTEN ports whose owning process cmdline mentions Strata. Reads
+// /proc/net/tcp (+ tcp6) for 127.0.0.1 LISTEN entries, maps each socket inode to the
+// pid that owns it via /proc/<pid>/fd, and keeps only Strata-owned ones. Best-effort;
+// any parse error yields [] (caller falls back to the default port).
+function discoveredGatewayPorts() {
+  const ports = new Set();
+  try {
+    const inodes = [];
+    for (const netFile of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      let raw;
+      try { raw = fs.readFileSync(netFile, "utf8"); } catch { continue; }
+      for (const line of raw.split("\n").slice(1)) {
+        const f = line.trim().split(/\s+/);
+        if (f.length < 10) continue;
+        const local = f[1]; // "0100007F:12B7:..." -> IP:PORT (hex)
+        const parts = local.split(":");
+        if (parts.length < 2) continue;
+        const ipHex = parts[0];
+        const portHex = parts[1];
+        // loopback 127.0.0.1 == 0100007F (tcp6 pads to 32 hex chars, same prefix).
+        if (!ipHex.toUpperCase().endsWith("0100007F")) continue;
+        const port = parseInt(portHex, 16);
+        if (!port || port <= 0 || port > 0xffff) continue;
+        const inode = f[9];
+        if (inode && inode !== "0") inodes.push([inode, port]);
+      }
+    }
+    if (inodes.length === 0) return [];
+    // Map socket inode -> owning pid. Scan /proc/<pid>/fd for socket:[inode].
+    const pids = fs.readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+    for (const pid of pids) {
+      let cmd;
+      try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8"); } catch { continue; }
+      if (!/strata/i.test(cmd)) continue; // only Strata-owned listeners
+      let fds;
+      try { fds = fs.readdirSync(`/proc/${pid}/fd`); } catch { continue; }
+      for (const fd of fds) {
+        let link;
+        try { link = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+        const m = /^socket:\[(\d+)\]$/.exec(link);
+        if (!m) continue;
+        for (const [inode, port] of inodes) {
+          if (m[1] === inode) ports.add(port);
+        }
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  return [...ports];
+}
+
+// Resolve the gateway base once per launch (cached). env override wins; else probe
+// candidates (default port first, then any Strata-owned loopback ports) and keep the
+// first that answers /models with a non-empty model list. Falls back to the default.
+let gatewayBaseCache = null;
+async function resolveGatewayBase() {
+  if (gatewayBaseCache) return gatewayBaseCache;
+  if (GATEWAY_BASE_ENV && GATEWAY_BASE_ENV.trim()) {
+    gatewayBaseCache = GATEWAY_BASE_ENV.trim().replace(/\/+$/, "");
+    return gatewayBaseCache;
+  }
+  const key = readStrataKey();
+  const candidates = [...new Set([DEFAULT_GATEWAY_PORT, ...discoveredGatewayPorts()])];
+  for (const port of candidates) {
+    const base = `http://127.0.0.1:${port}/v1`;
+    try {
+      const res = await fetch(`${base}/models`, {
+        headers: { "user-agent": GATEWAY_USER_AGENT, ...(key ? { authorization: `Bearer ${key}` } : {}) },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (Array.isArray(data?.data) && data.data.length > 0) {
+        gatewayBaseCache = base;
+        if (port !== DEFAULT_GATEWAY_PORT) {
+          shimLog("DEBUG", `discovered Strata gateway port=${port} (default ${DEFAULT_GATEWAY_PORT} not used)`);
+        }
+        return base;
+      }
+    } catch {
+      /* try next candidate */
+    }
+  }
+  gatewayBaseCache = `http://127.0.0.1:${DEFAULT_GATEWAY_PORT}/v1`;
+  return gatewayBaseCache;
+}
+
+// Resolve the Strata home dynamically so the shim works on another Linux box:
+// STRATA_HOME env wins, else ~/.strata. Never write under it (read-only rule).
+function resolveStrataHome() {
+  const env = process.env.STRATA_HOME;
+  if (env && env.trim()) return env.trim();
+  return `${process.env.HOME || os.homedir()}/.strata`;
+}
+
+function readStrataKey() {
+  try {
+    const statePath = `${resolveStrataHome()}/data/state.json`;
+    const raw = fs.readFileSync(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const key = parsed?.serving?.apiKey;
+    return typeof key === "string" ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+// Read the REAL context the loaded Strata model was tuned with, from
+// <strataHome>/data/native-tune/<modelId>.json: its `args` array contains
+// `"--max-context", <n>`. Returns the number, or null if the file/field is absent
+// (caller falls back to DEFAULT_STRATA_MAX_CONTEXT). Read-only; never writes ~/.strata.
+function readNativeTuneMaxContext(modelId) {
+  if (!modelId) return null;
+  try {
+    const p = `${resolveStrataHome()}/data/native-tune/${modelId}.json`;
+    const parsed = JSON.parse(fs.readFileSync(p, "utf8"));
+    const args = Array.isArray(parsed?.args) ? parsed.args : [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--max-context") {
+        const n = Number(args[i + 1]);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// The real model id the gateway serves (any Strata model, e.g. iq3_s).
+// It is discovered at runtime so the shim adapts if the served model changes.
+// HOT-PATH CACHE: this is dialed on EVERY completion request (and by the
+// token-count + context helpers). Strata serves ONE concurrent prediction, so
+// under load a /models round-trip queues behind the in-flight generation and
+// delays the first token -- which is exactly when a remote LM Link channel
+// idle-times-out (connection_closed). The served model id only changes when the
+// user swaps models in Strata, so it is cached for a short TTL: the first request
+// pays the round-trip, steady-state requests skip it, and a swap is picked up
+// within the TTL. A hard discovery failure still throws (cache not populated).
+let _gatewayModelCache = null; // { id, at }
+const GATEWAY_MODEL_TTL_MS = 5000;
+async function discoverGatewayModel() {
+  const now = Date.now();
+  if (_gatewayModelCache && now - _gatewayModelCache.at < GATEWAY_MODEL_TTL_MS) {
+    return _gatewayModelCache.id;
+  }
+  const key = readStrataKey();
+  const res = await fetch(`${await resolveGatewayBase()}/models`, {
+    headers: { "user-agent": GATEWAY_USER_AGENT, ...(key ? { authorization: `Bearer ${key}` } : {}) },
+  });
+  if (!res.ok) throw new Error(`gateway /models HTTP ${res.status}`);
+  const data = await res.json();
+  const ids = Array.isArray(data?.data)
+    ? data.data.map((m) => (m && typeof m.id === "string" ? m.id : null)).filter(Boolean)
+    : [];
+  if (ids.length === 0) throw new Error("gateway reports no loaded model");
+  _gatewayModelCache = { id: ids[0], at: now };
+  return ids[0];
+}
+
+// ---- real token count via the gateway (Strata's actual tokenizer) ----------
+// The conversation-summary countTokens (and the rag-v1 fit-check) must use the SAME
+// tokenizer as the header's per-turn usage, or the two disagree (user: header 168 vs
+// list 96). The gateway has no /tokenize route, but its /chat/completions returns the
+// real `usage.prompt_tokens` for the rendered prompt. It is dialed with max_tokens=1 and
+// prompt_tokens read -- that is Strata's exact count of the input string. Returns the
+// integer count, or null if the gateway call fails (caller falls back to the local
+// word-ish estimate). One extra tiny gateway call per countTokens; acceptable (counts
+// are not on the hot predict path).
+async function countTokensViaGateway(text) {
+  if (text == null) return null;
+  try {
+    const base = await resolveGatewayBase();
+    const key = readStrataKey();
+    const model = await discoverGatewayModel();
+    const res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": GATEWAY_USER_AGENT, ...(key ? { authorization: `Bearer ${key}` } : {}) },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: String(text) }], max_tokens: 1, stream: false }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const pt = data?.usage?.prompt_tokens;
+    return Number.isFinite(pt) && pt >= 0 ? Math.floor(pt) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- approximate tokenizer (round-trips; used only to size the raw path) --
+// Each token is a maximal run of non-whitespace OR a single whitespace char, so
+// detokenize(tokens) === text EXACTLY (round-trip preserved) and the count is a
+// realistic word-ish estimate (~chars/5), NOT 1-per-char. The 1-per-char version
+// over-counted a 316 KB PDF as ~316767 tokens, exceeding the advertised
+// tokens_max_model_len (262144) and making LM Studio's document-decision fit
+// check reject the document. Realistic counts keep the doc under the cap.
+// LM Studio's engine-protocol validators require `tokens` to be NONNEGATIVE INTEGER
+// token IDs (llama-server dialect) and, for the vLLM/OpenAI dialect, that `count` equal
+// the number of returned IDs. The old word-split returned STRING fragments, which failed
+// schema validation -> the conversation-summary updater's catch left tokenCount at 0.
+// FIX: return integer IDs. The same word-ish split is kept (so the COUNT stays a realistic
+// ~chars/5 estimate, not 1-per-char) but each distinct chunk is assigned a stable nonnegative
+// integer ID via a persistent bidirectional vocab, so detokenize(tokenize(s)) === s EXACTLY
+// (round-trip preserved) and the count is unchanged. The shim is a long-lived process, so the
+// vocab persists across requests; detokenize of IDs produced by an earlier tokenize resolves.
+const _tokVocab = new Map(); // text chunk -> id
+const _tokDetok = []; // id -> text chunk (index === id)
+function tokenize(text) {
+  const tokens = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === " " || ch === "\n" || ch === "\t" || ch === "\r") {
+      tokens.push(_tokIntern(ch));
+      i++;
+    } else {
+      let j = i;
+      while (j < text.length && text[j] !== " " && text[j] !== "\n" && text[j] !== "\t" && text[j] !== "\r") j++;
+      tokens.push(_tokIntern(text.slice(i, j)));
+      i = j;
+    }
+  }
+  return tokens;
+}
+function _tokIntern(chunk) {
+  const existing = _tokVocab.get(chunk);
+  if (existing !== undefined) return existing;
+  const id = _tokDetok.length;
+  _tokVocab.set(chunk, id);
+  _tokDetok.push(chunk);
+  return id;
+}
+function detokenize(tokens) {
+  return tokens.map((t) => {
+    const id = Number(t);
+    return id >= 0 && id < _tokDetok.length ? _tokDetok[id] : "";
+  }).join("");
+}
+
+// Fallback context ONLY when native-tune/<model>.json is unreadable. The real
+// value is discovered at runtime from Strata's native-tune file (no hardcoded
+// per-model context). Override via STRATA_MAX_CONTEXT env for a box whose
+// native-tune is not readable.
+const DEFAULT_STRATA_MAX_CONTEXT = (() => {
+  const n = Number(process.env.STRATA_MAX_CONTEXT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 262144;
+})();
+
+// Manual reasoning-effort default, for when LM Studio's built-in Reasoning badge is NOT
+// yet rendering (the fake safetensors model does not advertise reasoning metadata, so the
+// UI dropdown is absent and LM Studio sends no reasoning_effort). Precedence: a per-request
+// effort from LM Studio wins; else STRATA_REASONING_EFFORT env; else the config file
+// ~/.lmstudio/strata-shim.conf (KEY=VALUE lines; `reasoning_effort = low`). Valid values:
+// off|none|low|medium|high|max. Empty/absent -> null (gateway default). Read-only on the
+// conf file (never written). See docs/reasoning-effort-guide.md for how to set it.
+function manualReasoningEffort() {
+  const valid = new Set(["off", "none", "low", "medium", "high", "max"]);
+  const fromEnv = process.env.STRATA_REASONING_EFFORT;
+  if (fromEnv && valid.has(fromEnv.trim().toLowerCase())) return fromEnv.trim().toLowerCase();
+  try {
+    const confPath = `${process.env.LMSTUDIO_HOME || `${process.env.HOME || os.homedir()}/.lmstudio`}/strata-shim.conf`;
+    const raw = fs.readFileSync(confPath, "utf8");
+    for (const line of raw.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq < 0) continue;
+      const k = t.slice(0, eq).trim().toLowerCase();
+      const v = t.slice(eq + 1).trim().toLowerCase();
+      if (k === "reasoning_effort" && valid.has(v)) return v;
+    }
+  } catch {
+    /* no conf file -> fall through to the default */
+  }
+  // DEFAULT (user 2026-11-07): when LM Studio sends no reasoning_effort (the built-in
+  // Reasoning panel only exposes an on/off Enable-Thinking toggle + budget, not a low/med/
+  // high/max effort dropdown), default to "medium" rather than the gateway default. A per-request
+  // effort from LM Studio still wins (caller uses `effortFromRequest ?? manualReasoningEffort()`);
+  // STRATA_REASONING_EFFORT env or ~/.lmstudio/strata-shim.conf override this default. Set the
+  // conf/env value to "off"/"none" to disable. Override the default itself via
+  // STRATA_DEFAULT_REASONING_EFFORT.
+  const def = (process.env.STRATA_DEFAULT_REASONING_EFFORT || "medium").trim().toLowerCase();
+  return valid.has(def) ? def : "medium";
+}
+
+// Cached discovered context (resolved lazily once the served model is known).
+let strataMaxContextCache = null;
+async function resolveStrataMaxContext() {
+  if (strataMaxContextCache !== null) return strataMaxContextCache;
+  try {
+    const modelId = await discoverGatewayModel();
+    const ctx = readNativeTuneMaxContext(modelId);
+    if (ctx !== null) {
+      strataMaxContextCache = ctx;
+      shimLog("DEBUG", `discovered Strata max-context for model=${modelId}: ${ctx}`);
+      return ctx;
+    }
+  } catch {
+    /* fall through to default */
+  }
+  strataMaxContextCache = DEFAULT_STRATA_MAX_CONTEXT;
+  return strataMaxContextCache;
+}
+
+// Structured-output budget floor (fixes structured_output_failed, 2026-11-04).
+// LM Studio's engine-protocol predict stream wraps the completion in a structured-output
+// grammar and requires it to FINISH (finish_reason=stop + a valid parse). The gateway does
+// NOT do grammar-constrained decoding -- it free-runs, and this model spends ~100-130 tokens
+// on reasoning_content BEFORE it emits the JSON. So when LM Studio hands a small max_tokens
+// (the default output budget), the completion truncates mid-reasoning -> finish_reason=length
+// -> LM Studio rejects it as "structured output was incomplete; increase the output budget".
+// Fix: when a structured output is requested (response_format present), floor the output
+// budget so the model has room to reason AND emit the JSON. Capped at the real Strata context.
+// Override via STRATA_STRUCTURED_MIN_TOKENS for other models/contexts.
+const STRUCTURED_OUTPUT_MIN_TOKENS = (() => {
+  const n = Number(process.env.STRATA_STRUCTURED_MIN_TOKENS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 2048;
+})();
+
+// LM Studio's readiness sizes its AutoFit context probe AND its warmup generation
+// to the max_model_len reported in /v1/models. Reporting the full 262144 makes
+// that probe binary-search up to 262144 (gateway prefill grows ~linearly, so a
+// 131072-char probe alone is ~12s) -> the "fake" load crawls for MINUTES. But the
+// model is ALREADY loaded in Strata, so the load itself is trivial; only readiness
+// needs to pass quickly. So the advertised/probe context is capped to a small
+// fast-load default: the load finishes in seconds. Raising this raises the load
+// time roughly proportionally (bigger probe + bigger warmup).
+//
+// The explicit --max-model-len (the user's Context Length setting) is honoured and
+// capped at the real Strata context. When LM Studio passes `auto` (or nothing), this
+// small fast-load default is used instead of the full 262144.
+//
+// The REAL context (262144) is shown in the picker. The loaded instance's
+// contextLength = the max_model_len reported, so the REAL Strata context is
+// reported. This is fast because the user runs AutoFit OFF
+// (manual context) -> readiness does NOT binary-search; the warmup uses a tiny prompt
+// (max_tokens budget = context, not prompt length), so it stays ~1s. FAST_LOAD_MAX_MODEL_LEN
+// is kept as the fallback ONLY for when LM Studio passes `auto` AND AutoFit is ON (the
+// slow-probe case); with AutoFit OFF the real ctx is advertised.
+const FAST_LOAD_MAX_MODEL_LEN = 8192;
+
+// Apply LM Studio's --max-model-len against a given real Strata context cap.
+// `auto`/absent/non-numeric -> the real Strata context (the loaded instance's
+// context = what is reported in /v1/models, so the picker shows the real ctx).
+//
+// UPDATE 2026-11-04: the user sets the context in STRATA, not in LM Studio, and does
+// not want to dial a Context Length here. LM Studio still passes its default --max-model-len
+// (4096, AutoFit OFF), which previously capped the advertised context down to 4096. The
+// real discovered Strata context is now ALWAYS advertised and LM Studio's --max-model-len
+// is IGNORED
+// (it is not a meaningful cap for us -- the model is already loaded in Strata at its own
+// context). This is fast because the user runs AutoFit OFF (no binary-search probe); the
+// readiness warmup uses a tiny prompt (max_tokens budget = context, not prompt length) -> ~1s.
+function advertiseMaxModelLen(strataCtx) {
+  return strataCtx; // always the real Strata context, regardless of LM Studio's --max-model-len
+}
+
+// Startup fallback (used for the module export + when the gateway is not yet
+// reachable). The live /v1/models + /tokenize handlers recompute this against the
+// dynamically discovered Strata context.
+const MAX_MODEL_LEN = advertiseMaxModelLen(DEFAULT_STRATA_MAX_CONTEXT);
+
+// ---- advertised concurrency + flash-attention (COSMETIC) -------------------
+// LM Studio's "Max Concurrent Predictions" and "Flash Attention" are the HOST's
+// own per-model config keys (llm.load.numParallelSessions, llm.load.llama.
+// flashAttention). The host computes them from its per-engine defaults (llama.cpp
+// -> 4, vllm -> 8) and passes them DOWN to the engine on the spawn line
+// (--parallel / --max-num-seqs / --flash-attn); it never reads a slot count or a
+// flash-attn state back from an engine-protocol backend. Those spawn flags are ignored
+// (parseArgs reads only the four used) and no VRAM is reserved (no native
+// weight load happens -- the model is already served by Strata). These two
+// constants are therefore purely cosmetic: the same shape a native engine would report
+// is echoed so the load-info read sees a consistent, flash-attn-on, 4-slot
+// profile. Strata's serving gateway runs as many predictions in parallel as
+// set in its app "Concurrent requests" (default 1); the shim already accepts
+// and forwards them concurrently, so no shim change is needed at any slot count.
+const ADVERTISED_CONCURRENT_PREDICTIONS = 4;
+const ADVERTISED_FLASH_ATTENTION = true;
+
+// ---- logger --------------------------------------------------------------
+// Two sinks, formatted differently on purpose:
+//   * stderr -> LM Studio captures the child's stderr and prepends its OWN
+//     `YYYY-MM-DD HH:MM:SS [LEVEL]`, so a timestamp or level must NOT be repeated
+//     here (that was the duplicate `2026-11-08 ... [DEBUG]` line). Only `[bridge] <msg>`
+//     is emitted, letting LM Studio own the timestamp + level.
+//   * the dedicated file -> standalone (LM Studio does not prefix it), so it
+//     keeps the full `YYYY-MM-DD HH:MM:SS  [LEVEL] [bridge] <msg>` line and
+//     survives even if LM Studio drops child stderr.
+// Bodies are logged (truncated) so a Bionic tool turn is diagnosable -- to see
+// whether `tools` was sent and whether `tool_calls` came back. Long
+// prompt/message text is truncated; tool defs + tool_calls kept. By DEFAULT the
+// actual prompt/response content is HIDDEN ([Hidden(len)]) -- see redactContentEnabled
+// + the SENSITIVE_KEYS branch in logBody. Hiding is the safe default; showing is
+// an explicit opt-in (see below).
+const SHIM_LOG_FILE = `${process.env.HOME || os.homedir()}/.lmstudio/strata-shim.log`;
+
+// HIDE BY DEFAULT.
+// LM Studio's "Redact Content" toggle is persisted in
+// ~/.lmstudio/.internal/http-server-config.json as `logSensitiveData`
+// (true = show, false = hide). In practice that field proved UNRELIABLE for us:
+// it read `true` (show) even while the user had "Redact Content" ON in the UI,
+// so the body kept leaking. That field is therefore NOT allowed to force-show. The
+// bridge HIDES content by default. To deliberately SHOW bodies (debugging), the
+// user opts in explicitly, in precedence order:
+//   1. STRATA_REDACT_CONTENT env  -> 0/false/no = show, 1/true/yes = hide
+//   2. ~/.lmstudio/strata-shim.conf  `redact_content = false` -> show
+//   3. otherwise -> HIDE (safe default).
+// The LM Studio toggle is still read (read-only, same rule as the Strata key /
+// native-tune reads; never written) and honoured when it asks to HIDE, but a
+// `logSensitiveData: true` there no longer overrides the hide-by-default policy.
+// Re-read live (short TTL) so an env/conf change is picked up without a restart.
+let redactContentCache = null;
+let redactContentReadAt = 0;
+const REDACT_READ_TTL_MS = 2000;
+function redactContentEnabled() {
+  // 1. explicit env override wins.
+  const env = (process.env.STRATA_REDACT_CONTENT || "").trim().toLowerCase();
+  if (env === "1" || env === "true" || env === "yes") return true;
+  if (env === "0" || env === "false" || env === "no") return false;
+  // cached file/conf read (short TTL so there is no stat per SSE delta).
+  const now = Date.now();
+  if (redactContentCache !== null && now - redactContentReadAt < REDACT_READ_TTL_MS) {
+    return redactContentCache;
+  }
+  redactContentReadAt = now;
+  // 2. explicit conf opt-in to show: `redact_content = false`.
+  try {
+    const confPath = `${process.env.LMSTUDIO_HOME || `${process.env.HOME || os.homedir()}/.lmstudio`}/strata-shim.conf`;
+    for (const line of fs.readFileSync(confPath, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq < 0) continue;
+      if (t.slice(0, eq).trim().toLowerCase() === "redact_content") {
+        const v = t.slice(eq + 1).trim().toLowerCase();
+        if (v === "0" || v === "false" || v === "no") { redactContentCache = false; return false; }
+        if (v === "1" || v === "true" || v === "yes") { redactContentCache = true; return true; }
+      }
+    }
+  } catch {
+    /* no conf file -> keep default */
+  }
+  // 3. default: HIDE. (Showing is not triggered just because LM Studio's
+  // logSensitiveData reads true -- that field was the source of the leak.)
+  redactContentCache = true;
+  return true;
+}
+
+// Keys whose string values are the actual prompt/response content. When Redact
+// Content is on, these are replaced with [Hidden] (length kept so the fit-check
+// stays diagnosable) while the surrounding structure (roles, tool names, params
+// schema, tool_calls shape) is preserved.
+const SENSITIVE_KEYS = new Set(["content", "prompt", "reasoning_content", "reasoning", "text"]);
+
+// Serialize a body for logging: truncate long string values (prompt/message text)
+// but keep structure (keys, tools, tool_calls) so the tool path is visible. When
+// Redact Content is on, sensitive content values become [Hidden(len)] instead.
+function logBody(obj, maxStr = 240) {
+  const redact = redactContentEnabled();
+  const trunc = (s) => s.length > maxStr ? `${s.slice(0, maxStr)}…(${s.length})` : s;
+  const walk = (v, key) => {
+    if (typeof v === "string") {
+      if (redact && key !== undefined && SENSITIVE_KEYS.has(key)) return `[Hidden(${v.length})]`;
+      return trunc(v);
+    }
+    if (Array.isArray(v)) return `[${v.map((x) => walk(x, key)).join(",")}]`;
+    if (v && typeof v === "object") {
+      return `{${Object.entries(v).map(([k, x]) => `"${k}":${walk(x, k)}`).join(",")}}`;
+    }
+    return String(v);
+  };
+  return walk(obj);
+}
+
+function shimStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// Elapsed-since-start stamp in llama.cpp's own format: `M.SS.mmm.uuu`
+// (minutes.seconds.milliseconds.microseconds). A native llama-server engine
+// prefixes every stderr line with this, e.g. `0.00.029.296 I srv  llama_server:
+// initializing ...`. It is mirrored so the bridge's lines read like a real engine's.
+const PROCESS_START_MS = Date.now();
+function shimElapsed() {
+  const totalUs = Math.round((Date.now() - PROCESS_START_MS) * 1000);
+  const us = totalUs % 1000;
+  const ms = Math.floor(totalUs / 1000) % 1000;
+  const totalSec = Math.floor(totalUs / 1_000_000);
+  const sec = totalSec % 60;
+  const min = Math.floor(totalSec / 60);
+  const p = (n, w) => String(n).padStart(w, "0");
+  return `${min}.${p(sec, 2)}.${p(ms, 3)}.${p(us, 3)}`;
+}
+
+// llama.cpp severity letters (embedded in the line, NOT LM Studio's [LEVEL]):
+// D=debug, I=info, W=warning, E=error.
+function shimLevelLetter(level) {
+  switch (String(level).toUpperCase()) {
+    case "DEBUG": return "D";
+    case "WARN": case "WARNING": return "W";
+    case "ERROR": return "E";
+    default: return "I";
+  }
+}
+
+function shimLog(level, msg) {
+  // Standalone file: absolute timestamp + level + [bridge] tag (LM Studio does
+  // NOT prefix this file, so it needs the full stamp to be readable on its own).
+  try { fs.appendFileSync(SHIM_LOG_FILE, `${shimStamp()}  [${level}] [bridge] ${msg}\n`); } catch {}
+  // stderr: mimic a native llama.cpp engine line. LM Studio prepends its own
+  // `YYYY-MM-DD HH:MM:SS [LEVEL]` (plus a leading space), so only the
+  // llama-style relative stamp + severity letter + component + message is emitted:
+  //   0.00.029.296 I bridge: <msg>
+  process.stderr.write(`${shimElapsed()} ${shimLevelLetter(level)} bridge: ${msg}\n`);
+}
+
+async function handle(req, res) {
+  const url = req.url || "/";
+  const path = url.split("?")[0];
+  const method = req.method;
+
+  // /health — readiness parses the body as JSON,
+  // so an empty body throws and the poll never succeeds. Return a valid JSON object.
+  if (path === "/health" && (method === "GET" || method === "HEAD")) {
+    res.statusCode = 200;
+    res.end("{}");
+    return;
+  }
+
+  // /v1/models — echo the served-model-name so the driver's id match succeeds.
+  // Report the REAL Strata context (discovered from native-tune), so the loaded
+  // instance + picker show the true context, not a hardcoded guess.
+  if (path === "/v1/models" && method === "GET") {
+    const id = args.servedModelName || "strata";
+    const strataCtx = await resolveStrataMaxContext();
+    const advertised = advertiseMaxModelLen(strataCtx);
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      object: "list",
+      data: [
+        {
+          id,
+          object: "model",
+          created: Math.floor(Date.now() / 1000),
+          owned_by: "strata",
+          max_model_len: advertised,
+          // Cosmetic: mirror a native engine's concurrency/flash-attn profile. The
+          // vllm driver does not read these back (it drives them from its own
+          // config), but echoing them keeps the load-info shape consistent.
+          n_parallel: ADVERTISED_CONCURRENT_PREDICTIONS,
+          flash_attn: ADVERTISED_FLASH_ATTENTION,
+        },
+      ],
+    }));
+    return;
+  }
+
+  // /tokenize
+  if (path === "/tokenize" && method === "POST") {
+    const body = await readJson(req);
+    // vLLM's /tokenize accepts `prompt` as EITHER a string OR a list of strings
+    // (LM Studio's document/RAG decision step sends a LIST -- e.g. one entry per
+    // retrieved chunk). Handle both, else fall back to `messages`. This is a
+    // robustness improvement (a list prompt used to fall through to "" -> count:0).
+    // NOTE: the document-attachment failure is NOT caused by this count. Verified
+    // 2026-11-05: the real cause is LM Studio's built-in lmstudio/rag-v1 prompt
+    // preprocessor calling applyPromptTemplate on the vllm-kind engine, whose driver
+    // throws the promptTemplating capability gap CLIENT-SIDE (before any HTTP here).
+    let text = "";
+    if (typeof body.prompt === "string") text = body.prompt;
+    else if (Array.isArray(body.prompt)) text = body.prompt.map((p) => typeof p === "string" ? p : "").join("");
+    else if (Array.isArray(body.messages)) text = body.messages.map((m) => String(m?.content ?? "")).join("");
+    // #7d state: return Strata's REAL-ish count via the local integer-ID tokenize(). The vLLM
+    // dialect validates `count === tokens.length` AND that every token is a nonnegative integer,
+    // so tokenize() returns integer IDs whose length is the count. (The gateway-count experiment
+    // #7e was reverted -- it caused a regression; the local count is a realistic ~chars/5 estimate.)
+    const tokens = tokenize(text);
+    const count = tokens.length;
+    const strataCtx = await resolveStrataMaxContext();
+    // DIAGNOSTIC: surface the inbound tokenize body shape + which count source was used.
+    const keys = Object.keys(body).join(",");
+    const pType = Array.isArray(body.prompt) ? `list(${body.prompt.length})` : (typeof body.prompt === "string" ? `str(${body.prompt.length})` : (body.prompt === undefined ? "absent" : typeof body.prompt));
+    const mLen = Array.isArray(body.messages) ? `msgs(${body.messages.length})` : "none";
+    shimLog("DEBUG", `tokenize: ${count} tokens (local=${tokens.length}) | body keys=${keys} prompt=${pType} messages=${mLen}`);
+    res.statusCode = 200;
+    res.end(JSON.stringify({
+      tokens,
+      count,
+      tokens_max_model_len: advertiseMaxModelLen(strataCtx),
+    }));
+    return;
+  }
+
+  // /detokenize
+  if (path === "/detokenize" && method === "POST") {
+    const body = await readJson(req);
+    const tokens = Array.isArray(body.tokens) ? body.tokens.map((t) => Number(t)) : [];
+    res.statusCode = 200;
+    res.end(JSON.stringify({ prompt: detokenize(tokens) }));
+    return;
+  }
+
+  // /v1/chat/completions and /v1/completions — proxy to the gateway, stream SSE.
+  if ((path === "/v1/chat/completions" || path === "/v1/completions") && method === "POST") {
+    await proxyCompletion(req, res, path);
+    return;
+  }
+
+  res.statusCode = 404;
+  res.end(JSON.stringify({ error: { message: `strata-shim: no route for ${method} ${path}` } }));
+}
+
+async function readJson(req) {
+  const raw = await new Promise((resolve) => {
+    let acc = "";
+    req.on("data", (c) => { acc += c; });
+    req.on("end", () => resolve(acc));
+  });
+  try { return raw.length ? JSON.parse(raw) : {}; } catch { return {}; }
+}
+
+async function proxyCompletion(req, res, path) {
+  const t0 = Date.now();
+  const body = await readJson(req);
+
+  // Capture the caller's requested stream mode BEFORE stream:true is forced on
+  // the gateway (the gateway is SSE-only, so it is always asked to stream and
+  // the shim aggregates when the caller wanted a single JSON object).
+  const wantStream = body.stream === true;
+
+  // Log the inbound request (bodies unhidden 2026-11-06): the body is logged via
+  // logBody() (long prompt/message text truncated, structure + tools kept) so a
+  // Bionic tool turn is diagnosable -- to see whether `tools` was sent.
+  const promptLen = typeof body.prompt === "string"
+    ? body.prompt.length
+    : (Array.isArray(body.messages) ? body.messages.reduce((n, m) => n + String(m?.content ?? "").length, 0) : 0);
+  // Surface the OUTPUT BUDGET and structured-output knobs (not the prompt text)
+  // so the structured_output_failed / finish_reason=length path is diagnosable.
+  const outBudget = body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens ?? null;
+  const hasResponseFormat = body.response_format !== undefined && body.response_format !== null;
+  const rfType = hasResponseFormat ? (body.response_format?.type ?? "?") : null;
+  // Reasoning / thinking knobs. LM Studio's engine-protocol predict request carries
+  // reasoningEffort (camelCase) and/or thinking_budget_tokens; the OpenAI dialect uses
+  // reasoning_effort (snake). Capture whichever the caller sent so the path is diagnosable.
+  const reasoningEffortIn = body.reasoning_effort ?? body.reasoningEffort ?? null;
+  const thinkingBudgetIn = body.thinking_budget_tokens ?? body.thinkingBudget ?? null;
+  const toolsIn = Array.isArray(body.tools) ? body.tools.length : (body.tools ? "set" : "none");
+  const toolChoiceIn = body.tool_choice ?? null;
+  shimLog("DEBUG", `Received request: ${req.method} to ${path} body=${logBody(body)} (prompt_len=${promptLen}, stream=${wantStream}, max_tokens=${outBudget}, response_format=${hasResponseFormat ? rfType : "none"}, reasoning_effort=${reasoningEffortIn}, thinking_budget=${thinkingBudgetIn}, tools=${toolsIn}, tool_choice=${toolChoiceIn})`);
+
+  let gatewayModel;
+  try {
+    gatewayModel = await discoverGatewayModel();
+  } catch (err) {
+    res.statusCode = 502;
+    res.end(JSON.stringify({ error: { message: `gateway model discovery failed: ${err}` } }));
+    return;
+  }
+  body.model = gatewayModel;
+
+  const servedName = args.servedModelName || gatewayModel;
+
+  // The gateway is chat-only (/v1/completions and /v1/models are 404
+  // on the gateway). For the raw-completions dialect the prompt is wrapped as a
+  // single user message, the gateway's chat endpoint is called, and the
+  // SSE into the completions dialect below.
+  const isCompletions = path === "/v1/completions";
+  let gatewayBody;
+  if (isCompletions) {
+    const prompt = typeof body.prompt === "string" ? body.prompt : "";
+    gatewayBody = {
+      model: gatewayModel,
+      messages: [{ role: "user", content: prompt }],
+      stream: true,
+    };
+    if (body.max_tokens !== undefined) gatewayBody.max_tokens = body.max_tokens;
+    if (body.temperature !== undefined) gatewayBody.temperature = body.temperature;
+    if (body.stop !== undefined) gatewayBody.stop = body.stop;
+  } else {
+    body.stream = true;
+    gatewayBody = body;
+  }
+
+  // Structured-output budget floor: when the caller requested a structured output
+  // (response_format present -- LM Studio's engine-protocol predict stream always does),
+  // raise the output budget to STRUCTURED_OUTPUT_MIN_TOKENS if it was smaller, so the model
+  // has room to reason AND emit the JSON and the completion can reach finish_reason=stop.
+  // The error LM Studio shows literally says "increase the output budget". Capped at the
+  // real Strata context. Only raises -- never lowers an already-large budget. Unbounded
+  // (max_tokens absent) is left as-is (the gateway already defaults to its own max).
+  if (hasResponseFormat) {
+    const strataCtx = await resolveStrataMaxContext();
+    const floor = Math.min(STRUCTURED_OUTPUT_MIN_TOKENS, strataCtx);
+    const cur = gatewayBody.max_tokens;
+    if (typeof cur === "number" && cur < floor) {
+      gatewayBody.max_tokens = floor;
+      shimLog("DEBUG", `structured output: raised max_tokens ${cur} -> ${floor} (response_format=${rfType})`);
+    }
+  }
+
+  // Reasoning-effort translation: the gateway honours the OpenAI `reasoning_effort` field
+  // (verified: low -> shorter reasoning, high -> longer). LM Studio may send it camelCase
+  // (reasoningEffort) or snake (reasoning_effort); normalise to the gateway's snake form so
+  // the setting actually changes how the model reasons on host AND remote. `off`/null -> omit
+  // the field (gateway default). The thinking-budget knob has no gateway equivalent (the
+  // x-strata-budget header is ignored and the ~sNNNN model variants are rejected).
+  // A request-supplied effort wins; otherwise fall back to the MANUAL default (see
+  // STRATA_REASONING_EFFORT env / ~/.lmstudio/strata-shim.conf). This lets the user set
+  // a reasoning effort even before LM Studio's built-in Reasoning badge renders (the badge
+  // needs the model's metadata, which the fake safetensors dir does not yet advertise).
+  const effortFromRequest = reasoningEffortIn !== null && reasoningEffortIn !== undefined
+    ? String(reasoningEffortIn).toLowerCase()
+    : null;
+  const effectiveEffort = effortFromRequest ?? manualReasoningEffort();
+  if (effectiveEffort !== null && effectiveEffort !== "off" && effectiveEffort !== "none" && effectiveEffort !== "") {
+    gatewayBody.reasoning_effort = effectiveEffort;
+    shimLog("DEBUG", `reasoning_effort -> gateway: ${effectiveEffort}${effortFromRequest === null ? " (manual default)" : ""}`);
+  }
+
+  const key = readStrataKey();
+  const upstream = await fetch(`${await resolveGatewayBase()}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      "user-agent": GATEWAY_USER_AGENT,
+      ...(key ? { authorization: `Bearer ${key}` } : {}),
+    },
+    body: JSON.stringify(gatewayBody),
+  });
+
+  if (!upstream.ok) {
+    res.statusCode = upstream.status;
+    res.end(JSON.stringify({ error: { message: `gateway HTTP ${upstream.status}` } }));
+    return;
+  }
+
+  // Honour the requested `stream` mode (captured as wantStream at the top): the
+  // vLLM driver dials the engine protocol server NON-streaming (it expects a
+  // single JSON completion object), so when stream is not true the gateway's SSE is
+  // aggregated into one chat.completion / completion object. When stream is
+  // true SSE is forwarded.
+  // ---- incremental streaming (root-cause fix for the remote connection_closed) ----
+  // A native llama.cpp engine emits SSE tokens in REAL TIME, so the Link channel to a
+  // remote peer always has fresh signalUpdates and never idles. The shim used to BUFFER
+  // the whole gateway stream and flush it only after generation finished (one turn took
+  // ~29s), leaving a ~29s gap with no bytes on the Link channel -> the peer's channel
+  // idle-times-out -> connection_closed. Fix: set the SSE headers BEFORE the read loop and
+  // write each event inside drain()/collectEvent as it is produced, so bytes reach the
+  // host's engine-protocol client (and onward to the peer) token-by-token. Node's http
+  // server uses chunked transfer-encoding (no content-length) so each res.write flushes.
+  if (wantStream) {
+    res.statusCode = 200;
+    res.setHeader("content-type", "text/event-stream");
+    // Flush the SSE headers to the host's engine-protocol client IMMEDIATELY, before
+    // the gateway's first token. Under load the gateway's time-to-first-token can be
+    // long (prefill + the one-concurrent-prediction queue); without this the host
+    // sees no response start until the first delta arrives, which is when a remote
+    // LM Link channel can idle-time-out. Establishing the stream now keeps the
+    // channel alive while waiting for the gateway. (SSE comment keep-alives are NOT
+    // sent -- the peer's parser chokes on them, see stripSseComments.)
+    try { res.flushHeaders(); } catch {}
+  }
+
+  // ---- tokens/sec metrics (LM Studio info block) ----
+  // LM Studio's vLLM OpenAI-compat dialect reads a top-level `metrics` object off the
+  // FINAL completion chunk and computes the info-block figures from it (bundle RE,
+  // stats reader @12620192 + TPS computation @12620637):
+  //   timeToFirstTokenSec = time_to_first_token_ms / 1000
+  //   totalTimeSec        = (time_to_first_token_ms + generation_time_ms) / 1000
+  //   tokensPerSecond     = 1000 / mean_itl_ms   (mean_itl_ms = inter-token latency)
+  // These are vLLM --enable-per-request-metrics field names. They are synthesized from REAL
+  // measured timing of the gateway stream (one SSE delta ~= one token), so LM Studio shows a
+  // genuine tokens/sec figure for the fake model instead of the rate-less "625 tokens" line.
+  const streamStartAt = Date.now();
+  let firstTokenAt = null; // timestamp of the first token-bearing delta
+  let lastTokenAt = null;  // timestamp of the most recent token-bearing delta
+  let tokenCount = 0;      // number of token-bearing deltas seen
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events = []; // collected raw SSE events (for aggregation when non-streaming)
+  let doneSeen = false;
+
+  const collectEvent = (ev) => {
+    if (ev.includes("[DONE]")) { doneSeen = true; return; }
+    events.push(ev);
+    const now = Date.now();
+    if (eventHasDelta(ev)) {
+      if (firstTokenAt === null) firstTokenAt = now;
+      lastTokenAt = now;
+      tokenCount++;
+    }
+    // Stream incrementally: write each event the moment it is drained (streaming mode only).
+    if (wantStream) {
+      let out = reshapeEvent(ev, servedName, isCompletions);
+      // Attach metrics to the FINAL chunk so the dialect's stats reader sees them. With
+      // stream_options.include_usage the gateway appends a trailing usage chunk (empty choices
+      // + usage) AFTER the finish_reason chunk, and LM Studio reads `metrics` off the LAST
+      // chunk (getObjectProperty(eventData,'metrics'); `if (null === statsData) return {}`).
+      // So inject on the finish_reason chunk AND the usage chunk (whichever is last wins).
+      // Prefer the gateway's own `timings` block (real engine-measured numbers) when present.
+      if (eventFinishReason(ev) || eventHasUsage(ev)) out = injectMetrics(out, buildMetrics(streamStartAt, firstTokenAt, lastTokenAt, tokenCount, eventTimings(ev)));
+      res.write(stripSseComments(out) + "\n\n");
+    }
+  };
+
+  const drain = () => {
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const ev = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      collectEvent(ev);
+    }
+  };
+
+  try {
+    const reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      drain();
+    }
+    buffer += decoder.decode(new Uint8Array(), { stream: false });
+    drain();
+    if (buffer.trim().length > 0) collectEvent(buffer);
+  } catch (err) {
+    // In streaming mode headers (and partial body) may already be sent; only emit an
+    // error object if nothing has been flushed yet.
+    if (!wantStream || !res.headersSent) {
+      res.statusCode = 502;
+      res.end(JSON.stringify({ error: { message: `gateway stream failed: ${err}` } }));
+    }
+    return;
+  }
+
+  if (wantStream) {
+    // Events were already written incrementally inside collectEvent above; just terminate.
+    if (!doneSeen) res.write("data: [DONE]\n\n");
+    res.end();
+    // Compact streamed-response summary (bodies unhidden 2026-11-06): show whether
+    // tool_calls came back + finish_reason, without dumping every SSE event.
+    let streamFinish = null;
+    let streamToolCallDeltas = 0;
+    for (const ev of events) {
+      for (const line of ev.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice("data:".length).replace(/^ /, "");
+        if (payload === "[DONE]" || payload.length === 0) continue;
+        let obj; try { obj = JSON.parse(payload); } catch { continue; }
+        for (const c of (Array.isArray(obj?.choices) ? obj.choices : [])) {
+          if (c?.finish_reason) streamFinish = c.finish_reason;
+          const d = c?.delta;
+          if (d && Array.isArray(d.tool_calls)) streamToolCallDeltas += d.tool_calls.length;
+        }
+      }
+    }
+    shimLog("INFO", `streamed completion done in ${Date.now() - t0}ms (${events.length} events, finish_reason=${streamFinish}, tool_call_deltas=${streamToolCallDeltas})`);
+    let sTimings = null;
+    for (const ev of events) { const t = eventTimings(ev); if (t) sTimings = t; }
+    let sUsage = null;
+    for (const ev of events) { const u = eventUsage(ev); if (u) sUsage = u; }
+    for (const line of printTimingLines(sTimings, sUsage)) shimLog("INFO", line);
+    return;
+  }
+
+  // Non-streaming: aggregate the collected SSE deltas into one JSON object.
+  res.statusCode = 200;
+  res.setHeader("content-type", "application/json");
+  const aggregated = aggregateEvents(events, servedName, isCompletions);
+  // Attach metrics so the dialect's stats reader can show tokens/sec even for a buffered
+  // response. Prefer the gateway's own `timings` block (real engine-measured numbers) when
+  // present in any collected event; else approximate from token count + total elapsed.
+  let gatewayTimings = null;
+  for (const ev of events) { const t = eventTimings(ev); if (t) gatewayTimings = t; }
+  let nonStreamTokens = 0;
+  for (const ev of events) if (eventHasDelta(ev)) nonStreamTokens++;
+  const genMs = Math.max(0, Date.now() - t0);
+  const gaps = nonStreamTokens - 1;
+  const nsMetrics = buildMetrics(t0, t0, Date.now(), nonStreamTokens, gatewayTimings) ?? {
+    time_to_first_token_ms: 0,
+    generation_time_ms: genMs,
+    mean_itl_ms: gaps > 0 ? genMs / gaps : 0,
+  };
+  aggregated.metrics = nsMetrics;
+  res.end(JSON.stringify(aggregated));
+  shimLog("INFO", `non-streaming completion done in ${Date.now() - t0}ms (response=${logBody(aggregated)})`);
+  let nsUsage = null;
+  for (const ev of events) { const u = eventUsage(ev); if (u) nsUsage = u; }
+  for (const line of printTimingLines(gatewayTimings, nsUsage)) shimLog("INFO", line);
+}
+
+// Does an SSE event block carry a top-level `usage` object? Returns it (for the
+// print_timing breakdown's token counts), else null.
+function eventUsage(ev) {
+  for (const line of ev.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) continue;
+    let obj; try { obj = JSON.parse(payload); } catch { continue; }
+    if (obj && typeof obj.usage === "object" && obj.usage !== null) return obj.usage;
+  }
+  return null;
+}
+
+// Render a llama.cpp-style timing breakdown from the gateway's `timings` block
+// (prompt_ms / predicted_ms / predicted_n / predicted_per_second) plus the
+// completion's `usage` (prompt_tokens / completion_tokens). Mirrors the native
+// engine's `slot print_timing` lines so the bridge's log reads the same:
+//   prompt eval time =  60.14 ms /  10 tokens (  6.01 ms per token, 166.29 tokens per second)
+//          eval time = 295.44 ms /  30 tokens ( 10.19 ms per token,  98.16 tokens per second)
+//         total time = 355.58 ms /  40 tokens
+// Returns [] when the gateway gave no usable timings (nothing to mirror).
+function printTimingLines(timings, usage) {
+  if (!timings || typeof timings !== "object") return [];
+  const promptMs = Number(timings.prompt_ms);
+  const predMs = Number(timings.predicted_ms);
+  if (!Number.isFinite(promptMs) && !Number.isFinite(predMs)) return [];
+  const promptN = Number.isFinite(Number(usage?.prompt_tokens))
+    ? Number(usage.prompt_tokens)
+    : (Number.isFinite(Number(timings.prompt_n)) ? Number(timings.prompt_n) : null);
+  const predN = Number.isFinite(Number(usage?.completion_tokens))
+    ? Number(usage.completion_tokens)
+    : (Number.isFinite(Number(timings.predicted_n)) ? Number(timings.predicted_n) : null);
+  const padNum = (v, w) => (Number.isFinite(v) ? v.toFixed(2) : "?").padStart(w);
+  const padInt = (v, w) => (Number.isFinite(v) ? String(v) : "?").padStart(w);
+  const lines = [];
+  if (Number.isFinite(promptMs) && Number.isFinite(promptN) && promptN > 0) {
+    const perTok = promptMs / promptN;
+    const tps = perTok > 0 ? 1000 / perTok : 0;
+    lines.push(`prompt eval time = ${padNum(promptMs, 9)} ms / ${padInt(promptN, 5)} tokens (${padNum(perTok, 6)} ms per token, ${padNum(tps, 7)} tokens per second)`);
+  }
+  if (Number.isFinite(predMs) && Number.isFinite(predN) && predN > 0) {
+    const perTok = predMs / predN;
+    const tps = perTok > 0 ? 1000 / perTok : 0;
+    lines.push(`       eval time = ${padNum(predMs, 9)} ms / ${padInt(predN, 5)} tokens (${padNum(perTok, 6)} ms per token, ${padNum(tps, 7)} tokens per second)`);
+  }
+  if (Number.isFinite(promptMs) || Number.isFinite(predMs)) {
+    const totalMs = (Number.isFinite(promptMs) ? promptMs : 0) + (Number.isFinite(predMs) ? predMs : 0);
+    const totalN = (Number.isFinite(promptN) ? promptN : 0) + (Number.isFinite(predN) ? predN : 0);
+    lines.push(`      total time = ${padNum(totalMs, 9)} ms / ${padInt(totalN, 5)} tokens`);
+  }
+  return lines;
+}
+
+// Aggregate a list of raw SSE events (chat.completion.chunk deltas, or
+// completions choices[].text) into a single non-streaming completion object.
+function aggregateEvents(evts, servedName, isCompletions) {
+  const created = Math.floor(Date.now() / 1000);
+  let id = null;
+  let content = "";
+  let reasoning = "";
+  let finishReason = null;
+  let usage = null;
+  // Reassemble OpenAI streaming tool_calls deltas into a final message.tool_calls[].
+  // The gateway free-runs but DOES emit valid tool_calls: the first delta carries
+  // {index,id,type,function:{name,arguments:""}}, later deltas carry
+  // {index,function:{arguments:"<fragment>"}}. Merge by index, concat argument fragments.
+  const toolCalls = new Map(); // index -> {id, type, function:{name, arguments}}
+  for (const ev of evts) {
+    for (const line of ev.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice("data:".length).replace(/^ /, "");
+      if (payload === "[DONE]" || payload.length === 0) continue;
+      let obj;
+      try { obj = JSON.parse(payload); } catch { continue; }
+      if (typeof obj !== "object" || obj === null) continue;
+      if (typeof obj.id === "string") id = obj.id;
+      if (obj.usage) usage = obj.usage;
+      const choices = Array.isArray(obj.choices) ? obj.choices : [];
+      for (const c of choices) {
+        if (!c) continue;
+        if (c.finish_reason) finishReason = c.finish_reason;
+        const delta = (c && typeof c.delta === "object" && c.delta) ? c.delta : null;
+        if (delta) {
+          if (typeof delta.content === "string") content += delta.content;
+          if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              if (!tc || typeof tc !== "object") continue;
+              const idx = typeof tc.index === "number" ? tc.index : 0;
+              const entry = toolCalls.get(idx) || { id: null, type: "function", function: { name: "", arguments: "" } };
+              if (typeof tc.id === "string" && tc.id) entry.id = tc.id;
+              if (typeof tc.type === "string" && tc.type) entry.type = tc.type;
+              const fn = tc.function;
+              if (fn && typeof fn === "object") {
+                if (typeof fn.name === "string" && fn.name) entry.function.name += fn.name;
+                if (typeof fn.arguments === "string") entry.function.arguments += fn.arguments;
+              }
+              toolCalls.set(idx, entry);
+            }
+          }
+        } else if (typeof c.text === "string") {
+          content += c.text; // completions dialect already has .text
+          if (typeof c.reasoning_content === "string") reasoning += c.reasoning_content;
+        }
+      }
+    }
+  }
+  if (isCompletions) {
+    const choice = {
+      index: 0,
+      text: content,
+      finish_reason: finishReason,
+    };
+    if (reasoning.length > 0) choice.reasoning_content = reasoning;
+    const out = {
+      id: id || `cmp-${servedName}`,
+      object: "completion",
+      created,
+      model: servedName,
+      choices: [choice],
+    };
+    if (usage) out.usage = usage;
+    return out;
+  }
+  const message = { role: "assistant", content };
+  if (reasoning.length > 0) message.reasoning_content = reasoning;
+  if (toolCalls.size > 0) {
+    message.tool_calls = [...toolCalls.keys()].sort((a, b) => a - b).map((k) => {
+      const e = toolCalls.get(k);
+      return { id: e.id, type: e.type || "function", function: { name: e.function.name, arguments: e.function.arguments } };
+    });
+    if (finishReason == null) finishReason = "tool_calls";
+  }
+  const out = {
+    id: id || `chatcmpl-${servedName}`,
+    object: "chat.completion",
+    created,
+    model: servedName,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+  };
+  if (usage) out.usage = usage;
+  return out;
+}
+
+function reshapeEvent(ev, servedName, isCompletions) {
+  if (!isCompletions) return rewriteEvent(ev, servedName);
+  const lines = ev.split("\n");
+  const out = lines.map((line) => {
+    if (!line.startsWith("data:")) return line;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) return line;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return line; }
+    if (typeof obj !== "object" || obj === null) return line;
+    const created = Math.floor(Date.now() / 1000);
+    const choices = Array.isArray(obj.choices) ? obj.choices : [];
+    const newChoices = choices.map((c) => {
+      const delta = (c && typeof c.delta === "object" && c.delta) ? c.delta : {};
+      const text = typeof delta.content === "string" ? delta.content : "";
+      const nc = {
+        index: typeof c?.index === "number" ? c.index : 0,
+        text,
+        finish_reason: c?.finish_reason ?? null,
+      };
+      if (typeof delta.reasoning_content === "string") {
+        nc.reasoning_content = delta.reasoning_content;
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        nc.tool_calls = delta.tool_calls;
+      }
+      if (c?.usage) nc.usage = c.usage;
+      return nc;
+    });
+    const reshaped = {
+      id: typeof obj.id === "string" ? obj.id : `cmp-${servedName}`,
+      object: "completions",
+      created,
+      model: servedName,
+      choices: newChoices,
+    };
+    if (obj.usage) reshaped.usage = obj.usage;
+    return `data: ${JSON.stringify(reshaped)}`;
+  });
+  return out.join("\n");
+}
+
+function rewriteEvent(ev, servedName) {
+  // Keep comments / [DONE] as-is; rewrite the model field in JSON data lines.
+  const lines = ev.split("\n");
+  const out = lines.map((line) => {
+    if (!line.startsWith("data:")) return line;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) return line;
+    try {
+      const obj = JSON.parse(payload);
+      if (obj && typeof obj === "object") obj.model = servedName;
+      return `data: ${JSON.stringify(obj)}`;
+    } catch {
+      return line;
+    }
+  });
+  return out.join("\n");
+}
+
+// Strip SSE comment lines (lines starting with ":") from an event block. The
+// Strata gateway emits ": keep-alive" comments between data events; a native
+// llama.cpp engine does not. The remote peer's SSE parser chokes on these
+// comment lines, tearing down the connection. Dropping them makes the stream
+// byte-compatible with a native engine's framing.
+function stripSseComments(ev) {
+  const lines = ev.split("\n");
+  return lines.filter((line) => !line.startsWith(":")).join("\n");
+}
+
+// ---- tokens/sec metrics helpers (LM Studio info block) ----
+// See the metrics comment in proxyCompletion: LM Studio reads a top-level `metrics`
+// object off the final completion chunk and derives tokensPerSecond = 1000 / mean_itl_ms.
+
+// Does an SSE event block carry a token-bearing delta (content / reasoning_content /
+// tool_calls)? Used only to time the stream (one delta ~= one token).
+function eventHasDelta(ev) {
+  for (const line of ev.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) continue;
+    let obj; try { obj = JSON.parse(payload); } catch { continue; }
+    for (const c of (Array.isArray(obj?.choices) ? obj.choices : [])) {
+      const d = c?.delta;
+      if (d && (typeof d.content === "string" ? d.content.length > 0
+        : typeof d.reasoning_content === "string" ? d.reasoning_content.length > 0
+        : Array.isArray(d.tool_calls) && d.tool_calls.length > 0)) return true;
+    }
+  }
+  return false;
+}
+
+// Does an SSE event block carry a finish_reason (the final chunk)?
+function eventFinishReason(ev) {
+  for (const line of ev.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) continue;
+    let obj; try { obj = JSON.parse(payload); } catch { continue; }
+    for (const c of (Array.isArray(obj?.choices) ? obj.choices : [])) {
+      if (c?.finish_reason) return true;
+    }
+  }
+  return false;
+}
+
+// Does an SSE event block carry a top-level `usage` object? With stream_options.include_usage
+// the gateway appends a FINAL usage chunk (empty choices + usage). LM Studio's vLLM dialect
+// reads `metrics` off the LAST chunk (getObjectProperty(eventData,'metrics') then
+// `if (null === statsData) return {}`), so metrics MUST be attached to the usage chunk when
+// present, not only the finish_reason chunk.
+function eventHasUsage(ev) {
+  for (const line of ev.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) continue;
+    let obj; try { obj = JSON.parse(payload); } catch { continue; }
+    if (obj && typeof obj.usage === "object" && obj.usage !== null) return true;
+  }
+  return false;
+}
+
+// Build the vLLM --enable-per-request-metrics object from real measured timing.
+// mean_itl_ms = generation_time_ms / (tokenCount - 1) so tokensPerSecond = 1000/mean_itl_ms
+// equals the observed (tokenCount-1)*1000/generation_time_ms. Guard tokenCount<2 -> 0.
+//
+// PREFER the gateway's own `timings` block when present: the Strata gateway's final chunk
+// already carries a llama.cpp-style timings object {prompt_ms, predicted_ms, predicted_n,
+// predicted_per_second, ...} with REAL engine-measured numbers. Mapping those to the vLLM
+// metrics field names is far more accurate than wall-clock timing of the proxied stream:
+//   time_to_first_token_ms = prompt_ms (prefill time to first token)
+//   generation_time_ms     = predicted_ms (decode time)
+//   mean_itl_ms            = 1000 / predicted_per_second  (inter-token latency)
+// LM Studio derives tokensPerSecond = 1000/mean_itl_ms = predicted_per_second exactly.
+function buildMetrics(startAt, firstTokenAt, lastTokenAt, tokenCount, timings) {
+  if (timings && typeof timings === "object") {
+    const promptMs = typeof timings.prompt_ms === "number" ? timings.prompt_ms : null;
+    const predictedMs = typeof timings.predicted_ms === "number" ? timings.predicted_ms : null;
+    const perSec = typeof timings.predicted_per_second === "number" ? timings.predicted_per_second : null;
+    if (perSec !== null && perSec > 0) {
+      return {
+        time_to_first_token_ms: promptMs ?? 0,
+        generation_time_ms: predictedMs ?? 0,
+        mean_itl_ms: 1000 / perSec,
+      };
+    }
+    if (predictedMs !== null && predictedMs > 0) {
+      const n = typeof timings.predicted_n === "number" ? timings.predicted_n : tokenCount;
+      const gaps = Math.max(1, n - 1);
+      return {
+        time_to_first_token_ms: promptMs ?? 0,
+        generation_time_ms: predictedMs,
+        mean_itl_ms: predictedMs / gaps,
+      };
+    }
+  }
+  // Fallback: wall-clock timing of the proxied stream (one delta ~= one token).
+  if (firstTokenAt === null || lastTokenAt === null) return null;
+  const timeToFirstTokenMs = Math.max(0, firstTokenAt - startAt);
+  const generationTimeMs = Math.max(0, lastTokenAt - firstTokenAt);
+  const gaps = tokenCount - 1;
+  const meanItlMs = gaps > 0 ? generationTimeMs / gaps : 0;
+  return {
+    time_to_first_token_ms: timeToFirstTokenMs,
+    generation_time_ms: generationTimeMs,
+    mean_itl_ms: meanItlMs,
+  };
+}
+
+// Extract the gateway's `timings` object from an SSE event block (final chunk), if present.
+function eventTimings(ev) {
+  for (const line of ev.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) continue;
+    let obj; try { obj = JSON.parse(payload); } catch { continue; }
+    if (obj && typeof obj.timings === "object" && obj.timings !== null) return obj.timings;
+  }
+  return null;
+}
+
+// Inject a `metrics` object into the JSON payload of an SSE event block (the final chunk).
+// Adds it as a top-level sibling of choices, matching what the dialect's stats reader reads.
+function injectMetrics(outEvent, metrics) {
+  if (!metrics) return outEvent;
+  const lines = outEvent.split("\n");
+  const out = lines.map((line) => {
+    if (!line.startsWith("data:")) return line;
+    const payload = line.slice("data:".length).replace(/^ /, "");
+    if (payload === "[DONE]" || payload.length === 0) return line;
+    let obj; try { obj = JSON.parse(payload); } catch { return line; }
+    if (typeof obj !== "object" || obj === null) return line;
+    obj.metrics = metrics;
+    return `data: ${JSON.stringify(obj)}`;
+  });
+  return out.join("\n");
+}
+
+// ---- start (only when run as the main program, not when imported by tests) -
+if (import.meta.main) {
+  // One-time startup diagnostic: what LM Studio actually passed on the spawn line.
+  // Answers empirically whether runtime knobs (e.g. "Max Concurrent Predictions")
+  // reach an engine-protocol backend. Secret-bearing flag VALUES are masked.
+  logSpawnArgs();
+
+  // Diagnostic: log each request path + timing to stderr so the load sequence
+  // (health -> /v1/models -> AutoFit probe -> ...) is visible in the LM Studio
+  // log. Cheap, single line per request, no prompt/response bodies logged.
+  function makeServer() {
+    const server = http.createServer((req, res) => {
+      const t0 = Date.now();
+      const p = (req.url || "/").split("?")[0];
+      handle(req, res).catch((err) => {
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: { message: String(err) } }));
+        }
+        shimLog("ERROR", `request ${req.method} ${p} failed: ${String(err)}`);
+      });
+      res.on("finish", () => {
+        // Only log non-completion routes here; completions log their own timing.
+        if (p !== "/v1/chat/completions" && p !== "/v1/completions") {
+          shimLog("DEBUG", `request ${req.method} ${p} -> ${res.statusCode} ${Date.now() - t0}ms`);
+        }
+      });
+    });
+    return server;
+  }
+
+  // LM Studio can spawn a fresh engine while it is still tearing down the
+  // previous one (SIGTERM), so a port may be momentarily held by the dying
+  // shim. Retry the bind a few times before   giving up, so a reload does not
+  // fail with "exited before becoming healthy".
+  //
+  // But LM Studio also keeps the PREVIOUS strata-model instance loaded (IDLE)
+  // across reloads, so its shim keeps holding its ports and never releases them —
+  // a fresh spawn then races forever and gives up (exitCode=1). Fix: before binding,
+  // free the ports by SIGTERMing any OTHER strata-shim process (bridge processes
+  // only — never LM Studio's). The new shim then owns the ports and answers with the
+  // new instanceReference, so readiness's id-match succeeds.
+  function killOtherShims() {
+    const self = process.pid;
+    let killed = 0;
+    try {
+      const proc = fs.readdirSync("/proc");
+      for (const d of proc) {
+        if (!/^\d+$/.test(d)) continue;
+        const pid = Number(d);
+        if (pid === self) continue;
+        try {
+          const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, "binary");
+          // Match bridge processes by either the script path (before process.title
+          // is applied) or the renamed title (after). Never matches LM Studio.
+          if (cmd.includes("strata-shim") || cmd.includes("lm-studio-bridge")) {
+            process.kill(pid, "SIGTERM");
+            shimLog("DEBUG", `freed ports: SIGTERM to other strata-shim pid=${pid}`);
+            killed++;
+          }
+        } catch {}
+      }
+    } catch {}
+    return killed;
+  }
+
+  const LISTEN_RETRIES = 20;
+  const LISTEN_RETRY_MS = 500;
+  let listenAttempt = 0;
+
+  // Bind every port LM Studio dials (the random --port for readiness AND the
+  // static :8000 for the load-info read). Each port needs its own http.Server.
+  // listen() errors arrive via the server's 'error' event, NOT the callback.
+  function tryListen() {
+    listenAttempt++;
+    const servers = [];
+    let bound = 0;
+    let failed = false;
+    for (const port of BIND_PORTS) {
+      const srv = makeServer();
+      servers.push(srv);
+      srv.once("error", (err) => {
+        if (err.code === "EADDRINUSE") {
+          failed = true;
+        } else {
+          shimLog("ERROR", `server error on :${port}: ${err.code || err}`);
+          failed = true;
+        }
+      });
+      srv.listen(port, BIND_HOST, () => {
+        bound++;
+        shimLog("DEBUG", `listening on http://${BIND_HOST}:${port}`);
+      });
+    }
+    // Defer the success/failure decision until all listen() callbacks have fired.
+    setTimeout(() => {
+      if (!failed && bound === BIND_PORTS.length) {
+        return; // all ports bound, live
+      }
+      if (failed && listenAttempt < LISTEN_RETRIES) {
+        const freed = killOtherShims();
+        shimLog("DEBUG", `port busy (teardown race), retrying ${listenAttempt}/${LISTEN_RETRIES} (freed ${freed} other shim(s))`);
+        for (const s of servers) {
+          try { s.close(); } catch {}
+        }
+        setTimeout(tryListen, LISTEN_RETRY_MS);
+      } else if (failed) {
+        shimLog("ERROR", "port still in use after retries, giving up");
+        process.exit(1);
+      }
+    }, 100);
+  }
+
+  tryListen();
+}
+
+// ---- exports (pure functions + gateway helpers, importable by tests / the llama shim)
+// The llama-server-kind shim (strata-shim-llama) reuses the gateway discovery, key
+// reading, tokenizer, and SSE reshaping helpers from this file so both routes share ONE
+// implementation of the Strata-proxy plumbing. Importing this module does NOT start a
+// server (the server only starts under import.meta.main), so importing is side-effect
+// light (it sets process.title + reads the sibling manifest version).
+export {
+  rewriteEvent, reshapeEvent, tokenize, detokenize, MAX_MODEL_LEN, aggregateEvents,
+  stripSseComments, injectMetrics, buildMetrics, eventHasDelta, eventFinishReason,
+  eventHasUsage, eventTimings, eventUsage, printTimingLines,
+  // gateway + config helpers (shared with the llama shim):
+  resolveGatewayBase, readStrataKey, discoverGatewayModel, resolveStrataMaxContext,
+  advertiseMaxModelLen, manualReasoningEffort, shimLog, logBody, readJson,
+  countTokensViaGateway, logSpawnArgs,
+  ADVERTISED_CONCURRENT_PREDICTIONS, ADVERTISED_FLASH_ATTENTION,
+  STRUCTURED_OUTPUT_MIN_TOKENS, DEFAULT_STRATA_MAX_CONTEXT, GATEWAY_USER_AGENT,
+};

@@ -1,0 +1,23 @@
+{
+  "name": "strata-linux-x86_64-vulkan-avx2",
+  "domains": ["llm"],
+  "version": "2.72.0",
+  "engine": "llama.cpp",
+  "target_libraries": [
+    { "name": "llm_engine.node", "type": "llm_engine", "version": "0.1.2" },
+    { "name": "liblmstudio_bindings.node", "type": "liblmstudio", "version": "0.2.26" }
+  ],
+  "platform": "linux",
+  "cpu": { "architecture": "x86_64", "instruction_set_extensions": ["AVX2"] },
+  "gpu": { "framework": "Vulkan" },
+  "supported_model_formats": ["gguf"],
+  "manifest_version": "4",
+  "extension_type": "engine",
+  "vendor_lib_package_names": ["linux-llama-vulkan-vendor-v1"],
+  "minimum_lmstudio_version": "0.4.0+15",
+  "minimum_llmster_version": "0.0.1+9",
+  "engine_protocol_server": {
+    "runtime_kind": "llama-server",
+    "executable_relative_path": "strata-launch-llama"
+  }
+}
